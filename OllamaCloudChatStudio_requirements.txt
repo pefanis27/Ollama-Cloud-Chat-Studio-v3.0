@@ -1,5 +1,0 @@
-# Requirements manifest for Ollama Cloud Chat Browser v6 build
-# For server-side PDF export you also need Microsoft Edge, Google Chrome or Chromium installed.
-pyinstaller
-pypdf
-PyMuPDF
