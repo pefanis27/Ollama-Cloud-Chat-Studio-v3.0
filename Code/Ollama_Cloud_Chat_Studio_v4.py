@@ -4386,6 +4386,137 @@ def _repair_plot_string_token(token_text: str) -> str:
     return f'{fixed_prefix}{quote}{body}{quote}'
 
 
+
+def _repair_single_var_list_unpack(code_text: str) -> str:
+    """Διορθώνει το μοτίβο '[var] = expr' που παράγει το AI αντί για 'var = expr'.
+
+    Το '[H_plus] = scalar' είναι έγκυρο Python μόνο αν το δεξί μέλος είναι
+    iterable με ακριβώς ένα στοιχείο.  Για scalars (numpy, float, int κ.λπ.)
+    προκαλεί TypeError.  Αντικαθιστούμε '[X] = ...' με 'X = ...' όταν το
+    αριστερό μέλος είναι ακριβώς ένα απλό identifier μέσα σε αγκύλες.
+    """
+    # Regex: γραμμές με [simple_identifier] = ... στο επίπεδο ανάθεσης
+    # Αποφεύγει: [a, b] = ..., [a[0]] = ..., for [x] in ..., if [x] == ...
+    pattern = re.compile(
+        r'^(\s*)\[([A-Za-z_][A-Za-z0-9_]*)\]\s*=(?!=)',
+        re.MULTILINE,
+    )
+    return pattern.sub(r'\1\2 =', code_text)
+
+
+def _auto_close_unbalanced_python_delimiters(code_text: str) -> str:
+    """Κλείνει heuristically ανοιχτά (), [], {}, καθώς και απλά/triple quotes στο EOF.
+
+    Δεν ανακατασκευάζει χαμένο περιεχόμενο· απλώς προσθέτει τους ελάχιστους
+    κλείνοντες χαρακτήρες ώστε να αποφευχθεί άμεσο SyntaxError όταν το LLM
+    ξέχασε τα τελευταία closers του block.
+    """
+    text = str(code_text or '')
+    if not text:
+        return text
+    stack: List[str] = []
+    in_single = False
+    in_double = False
+    in_triple_single = False
+    in_triple_double = False
+    escaped = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        nxt3 = text[i:i + 3]
+        if in_triple_single:
+            if nxt3 == "'''":
+                in_triple_single = False
+                i += 3
+                continue
+            i += 1
+            continue
+        if in_triple_double:
+            if nxt3 == '"""':
+                in_triple_double = False
+                i += 3
+                continue
+            i += 1
+            continue
+        if in_single:
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if ch == '#':
+            nl = text.find('\n', i)
+            if nl == -1:
+                break
+            i = nl + 1
+            continue
+        if nxt3 == "'''":
+            in_triple_single = True
+            i += 3
+            continue
+        if nxt3 == '"""':
+            in_triple_double = True
+            i += 3
+            continue
+        if ch == "'":
+            in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            i += 1
+            continue
+        if ch in '([{':
+            stack.append(ch)
+        elif ch in ')]}':
+            if stack:
+                top = stack[-1]
+                if (top, ch) in {('(', ')'), ('[', ']'), ('{', '}')}:
+                    stack.pop()
+        i += 1
+    closers: List[str] = []
+    if in_triple_single:
+        closers.append("'''")
+    elif in_triple_double:
+        closers.append('"""')
+    elif in_single:
+        closers.append("'")
+    elif in_double:
+        closers.append('"')
+    mapping = {'(': ')', '[': ']', '{': '}'}
+    while stack:
+        closers.append(mapping.get(stack.pop(), ''))
+    suffix = ''.join(filter(None, closers))
+    if not suffix:
+        return text
+    if text.endswith('\n'):
+        return text + suffix
+    return text + '\n' + suffix
+
+
+def _syntax_error_looks_truncated(exc: SyntaxError) -> bool:
+    """Εντοπίζει αν το SyntaxError μοιάζει με EOF/truncation του code block."""
+    msg = str(getattr(exc, 'msg', '') or '').lower()
+    return (
+        'was never closed' in msg
+        or 'unterminated' in msg
+        or 'eof while scanning' in msg
+        or 'unexpected eof' in msg
+    )
+
 def repair_python_plot_code(code_text: str) -> str:
     """Εφαρμόζει ασφαλή heuristic repairs σε plotting code που παράχθηκε από LLM ώστε να γίνει πιο ανθεκτικό στο render."""
     repaired = _strip_python_code_fences(str(code_text or ''))
@@ -4395,6 +4526,8 @@ def repair_python_plot_code(code_text: str) -> str:
     repaired = _join_broken_plot_lines(repaired)
     repaired = _comment_suspicious_plaintext_lines(repaired)
     repaired = _repair_non_ascii_fstring_placeholders(repaired)
+    repaired = _repair_single_var_list_unpack(repaired)
+    repaired = _auto_close_unbalanced_python_delimiters(repaired)
     try:
         tokens = []
         stream = io.StringIO(repaired)
@@ -4477,6 +4610,37 @@ def render_python_plot_to_generated_media(code_text: str, suggested_filename: st
         safe_name += '.py'
     script_path = session_dir / safe_name
     script_path.write_text(code_text, encoding='utf-8', newline='\n')
+    try:
+        exact_source = script_path.read_text(encoding='utf-8')
+    except Exception as exc:
+        shutil.rmtree(session_dir, ignore_errors=True)
+        return (False, f'Αποτυχία επαλήθευσης του plotting script μετά την αποθήκευση: {exc}', None)
+    is_valid_exact, validation_message_exact = validate_python_code_block(exact_source)
+    if not is_valid_exact:
+        shutil.rmtree(session_dir, ignore_errors=True)
+        return (False, f'Το plotting script έχει συντακτικό σφάλμα και δεν μπορεί να αποδοθεί.\n{validation_message_exact}', None)
+    try:
+        compile(exact_source, str(script_path), 'exec')
+    except SyntaxError as exc:
+        line_no = getattr(exc, 'lineno', None) or 0
+        offset = getattr(exc, 'offset', None) or 0
+        bad_line = ''
+        exact_lines = exact_source.splitlines()
+        if 1 <= line_no <= len(exact_lines):
+            bad_line = exact_lines[line_no - 1]
+        pointer = ' ' * max(offset - 1, 0) + '^' if offset else ''
+        details = [f'Το plotting script έχει συντακτικό σφάλμα και δεν μπορεί να αποδοθεί.', f'SyntaxError στη γραμμή {line_no}: {exc.msg}']
+        if _syntax_error_looks_truncated(exc):
+            details.append('Το code φαίνεται ατελές ή κομμένο πριν ολοκληρωθούν λίστες, παρενθέσεις, dict ή strings.')
+        if bad_line:
+            details.append(bad_line)
+        if pointer:
+            details.append(pointer)
+        shutil.rmtree(session_dir, ignore_errors=True)
+        return (False, '\n'.join(details), None)
+    except Exception as exc:
+        shutil.rmtree(session_dir, ignore_errors=True)
+        return (False, f'Αποτυχία compile του plotting script πριν το render: {exc}', None)
     output_path = session_dir / ((Path(safe_name).stem or 'generated_plot') + '.png')
     runner_path = session_dir / '_plot_runner.py'
     runner_code = r"""import builtins
@@ -4523,17 +4687,422 @@ def _emit_json(payload):
         pass
 
 plt.show = _patched_show
+
+
+def _find_existing_output_file(preferred_path):
+    try:
+        candidates = []
+        preferred_dir = os.path.dirname(preferred_path) or os.getcwd()
+        for name in os.listdir(preferred_dir):
+            candidate = os.path.join(preferred_dir, name)
+            if not os.path.isfile(candidate):
+                continue
+            lower = name.lower()
+            if lower.endswith(('.png', '.jpg', '.jpeg', '.svg', '.webp')) and os.path.getsize(candidate) > 0:
+                candidates.append(candidate)
+        if not candidates:
+            return ''
+        candidates.sort(key=lambda path: (0 if os.path.abspath(path) == os.path.abspath(preferred_path) else 1, -os.path.getmtime(path)))
+        return candidates[0]
+    except Exception:
+        return ''
+
+
+# -- Matplotlib mathtext sanitizer ------------------------------------------
+# Στρατηγική: ΥΒΡΙΔΙΚΗ (blacklist + whitelist)
+# 1. Blacklist: γρήγορος έλεγχος γνωστών unsupported LaTeX packages/commands
+# 2. Whitelist: εξάγει ΟΛΕΣ τις \commands από math blocks — αν οποιαδήποτε
+#    ΔΕΝ βρίσκεται στη λίστα υποστηριζόμενων matplotlib commands, sanitize.
+# Αποτέλεσμα: κανένα άγνωστο LaTeX command δεν φτάνει στο mathtext parser.
+
+# ── Whitelist: ΟΛΑ τα commands που υποστηρίζει το matplotlib mathtext ──────
+_MPL_SAFE_COMMANDS = frozenset({
+    # ── Ελληνικά πεζά ──────────────────────────────────────────────────────
+    'alpha','beta','gamma','delta','epsilon','varepsilon','zeta','eta',
+    'theta','vartheta','iota','kappa','lambda','mu','nu','xi',
+    'pi','varpi','rho','varrho','sigma','varsigma','tau','upsilon',
+    'phi','varphi','chi','psi','omega',
+    # ── Ελληνικά κεφαλαία ─────────────────────────────────────────────────
+    'Gamma','Delta','Theta','Lambda','Xi','Pi','Sigma','Upsilon',
+    'Phi','Psi','Omega',
+    # ── Δομή εκφράσεων ────────────────────────────────────────────────────
+    'frac','dfrac','tfrac','cfrac','sfrac',
+    'sqrt','root',
+    'over','atop','choose','binom','tbinom','dbinom',
+    # ── Μεγάλοι τελεστές ──────────────────────────────────────────────────
+    'sum','prod','int','oint','iint','iiint','iiiint','idotsint','coprod',
+    'biguplus','bigcup','bigcap','bigodot','bigotimes','bigoplus',
+    'bigvee','bigwedge','bigsqcup',
+    # ── Σχέσεις — βασικές ─────────────────────────────────────────────────
+    'leq','le','geq','ge','neq','ne','equiv','propto',
+    'approx','approxeq','thickapprox','sim','simeq','thicksim',
+    'prec','succ','preceq','succeq','precsim','succsim',
+    'precapprox','succapprox',
+    'subset','supset','subseteq','supseteq','sqsubseteq','sqsupseteq',
+    'sqsubset','sqsupset','in','notin','ni','owns',
+    'perp','parallel','cong','asymp','smile','frown',
+    'between','ll','gg','doteq','models','vdash','dashv','mid',
+    # ── Σχέσεις — AMS ─────────────────────────────────────────────────────
+    'lesssim','gtrsim','lessapprox','gtrapprox',
+    'lessgtr','gtrless','lesseqgtr','gtreqless',
+    'eqless','eqgtr','eqslantless','eqslantgtr',
+    'nless','ngtr','nleq','ngeq','lneq','gneq','lneqq','gneqq',
+    'lvertneqq','gvertneqq','lnsim','gnsim','lnapprox','gnapprox',
+    'nprec','nsucc','precneqq','succneqq','precnsim','succnsim',
+    'precnapprox','succnapprox','npreceq','nsucceq',
+    'nsubseteq','nsupseteq','nsubseteqq','nsupseteqq',
+    'subsetneq','supsetneq','subsetneqq','supsetneqq',
+    'nsim','ncong','nshortmid','nshortparallel',
+    'nparallel','nmid','nperp',
+    'nvdash','nvDash','nVdash','nVDash',
+    'vDash','Vdash','Vvdash',
+    'triangleq','circeq','risingdotseq','fallingdotseq','doteqdot',
+    'eqcirc','bumpeq','Bumpeq','backsim','backsimeq',
+    'shortmid','shortparallel','pitchfork',
+    # ── Βέλη ──────────────────────────────────────────────────────────────
+    'leftarrow','rightarrow','Leftarrow','Rightarrow',
+    'leftrightarrow','Leftrightarrow','to','gets',
+    'uparrow','downarrow','Uparrow','Downarrow',
+    'updownarrow','Updownarrow','nearrow','nwarrow','searrow','swarrow',
+    'mapsto','longmapsto','hookleftarrow','hookrightarrow',
+    'leftharpoonup','leftharpoondown','rightharpoonup','rightharpoondown',
+    'rightleftharpoons','leftrightharpoons','upharpoonleft','upharpoonright',
+    'downharpoonleft','downharpoonright',
+    'longleftarrow','longrightarrow','Longleftarrow','Longrightarrow',
+    'longleftrightarrow','Longleftrightarrow','leadsto',
+    'xleftarrow','xrightarrow','xleftrightarrow',
+    'xLeftarrow','xRightarrow','xLeftrightarrow',
+    'dashleftarrow','dashrightarrow','Rrightarrow','Lleftarrow',
+    'rightsquigarrow','leftrightsquigarrow',
+    'curvearrowleft','curvearrowright','circlearrowleft','circlearrowright',
+    'Lsh','Rsh','looparrowleft','looparrowright',
+    'twoheadleftarrow','twoheadrightarrow',
+    'leftarrowtail','rightarrowtail',
+    # ── Δυαδικοί τελεστές ─────────────────────────────────────────────────
+    'pm','mp','times','div','cdot','ast','star','circ','bullet',
+    'cap','cup','vee','wedge','lor','land',
+    'oplus','ominus','otimes','oslash','odot','boxplus','boxminus',
+    'boxtimes','boxdot','Box',
+    'setminus','smallsetminus','amalg','wr','dagger','ddagger',
+    'sqcap','sqcup','triangleleft','triangleright',
+    'lhd','rhd','unlhd','unrhd',
+    'bigtriangleup','bigtriangledown',
+    'ltimes','rtimes','dotplus','bowtie','Join',
+    'intercal','veebar','barwedge','doublebarwedge',
+    'curlyvee','curlywedge','circleddash','circledast','circledcirc',
+    'centerdot','divideontimes',
+    # ── Διάφορα σύμβολα ───────────────────────────────────────────────────
+    'infty','partial','nabla','forall','exists','nexists',
+    'emptyset','varnothing','wp','Re','Im','ell','hbar','hslash',
+    'imath','jmath','angle','measuredangle','sphericalangle',
+    'prime','backprime','backslash','neg','lnot','surd',
+    'flat','natural','sharp',
+    'dag','ddag','S','P',
+    'clubsuit','diamondsuit','heartsuit','spadesuit',
+    'aleph','beth','daleth','gimel',
+    'mho','eth','complement','Finv','Game',
+    'digamma','varkappa','Bbbk',
+    'square','blacksquare','lozenge','blacklozenge',
+    'triangle','blacktriangle','triangledown','blacktriangledown',
+    'blacktriangleleft','blacktriangleright','bigstar',
+    'therefore','because',
+    'checkmark','maltese','circledS','yen','euro','EurAlt',
+    'copyright','pounds','cent',
+    # ── Τελείες ───────────────────────────────────────────────────────────
+    'ldots','cdots','vdots','ddots','hdots','ldotp','cdotp',
+    # ── Τόνοι / accents ───────────────────────────────────────────────────
+    'hat','check','tilde','acute','grave','dot','ddot','dddot','ddddot',
+    'breve','bar','vec',
+    'widehat','widetilde','wideparen',
+    'overline','underline',
+    'overleftarrow','overrightarrow','overleftrightarrow',
+    'underleftarrow','underrightarrow','underleftrightarrow',
+    'overbrace','underbrace',
+    'overset','underset','stackrel','buildrel',
+    'xlongequal',
+    # ── Παρενθέσεις / delimiters ──────────────────────────────────────────
+    'left','right',
+    'big','Big','bigg','Bigg',
+    'bigl','bigr','Bigl','Bigr','biggl','biggr','Biggl','Biggr',
+    'lfloor','rfloor','lceil','rceil','langle','rangle',
+    'lgroup','rgroup','lmoustache','rmoustache',
+    'lvert','rvert','lVert','rVert',
+    'ulcorner','urcorner','llcorner','lrcorner',
+    # ── Μαθηματικές συναρτήσεις ───────────────────────────────────────────
+    'arccos','arcsin','arctan','cos','cosh','cot','coth','csc',
+    'deg','det','dim','exp','gcd','hom','inf','ker',
+    'lg','lim','liminf','limsup','ln','log','max','min',
+    'Pr','sec','sin','sinh','sup','tan','tanh',
+    'injlim','projlim','varlimsup','varliminf','varinjlim','varprojlim',
+    'arg','erf','erfc','sgn',
+    # ── Fonts (supported by matplotlib) ───────────────────────────────────
+    'mathrm','mathit','mathbf','mathtt','mathsf','mathcal',
+    'mit','cal','rm','bf','it','tt','sf','sl',
+    # ── Style / size ──────────────────────────────────────────────────────
+    'displaystyle','textstyle','scriptstyle','scriptscriptstyle',
+    'normalsize','small','footnotesize','large','Large','LARGE','huge','Huge',
+    # ── Limits ────────────────────────────────────────────────────────────
+    'limits','nolimits','displaylimits',
+    # ── Spacing (supported by matplotlib) ─────────────────────────────────
+    'quad','qquad',
+    # ── Phantom / smash ───────────────────────────────────────────────────
+    'phantom','vphantom','hphantom','smash','mathstrut',
+    # ── Misc ──────────────────────────────────────────────────────────────
+    'not',
+    'mathord','mathop','mathbin','mathrel','mathopen',
+    'mathclose','mathpunct','mathinner',
+    'vcenter','raise','lower','moveleft','moveright',
+    'hline','cline','multicolumn',
+    'substack',
+    # ── AMS extra ─────────────────────────────────────────────────────────
+    'eqref','tag','notag','nonumber',
+    'label','ref',
+    'text','intertext',  # Μόνο στο runner context — το text{} πιάνεται αλλού
+})
+
+# ── Blacklist: γνωστά unsupported LaTeX packages / commands ────────────────
+# Χρησιμεύει ως fast-path πριν τον ακριβέστερο whitelist έλεγχο.
+_MPL_BLACKLIST = (
+    # Environments (catch-all)
+    r'\begin', r'\end',
+    # Chemistry — mhchem
+    r'\ce{', r'\cee{', r'\cf{', r'\cein{', r'\ceout{',
+    # Physics package — quantum mechanics
+    r'\bra{', r'\ket{', r'\braket{', r'\ketbra{',
+    r'\mel{', r'\ev{', r'\expval{', r'\matrixel{',
+    r'\comm{', r'\acomm{', r'\anticommutator{',
+    # Physics package — derivatives
+    r'\pdv{', r'\dv{', r'\fdv{', r'\variation{',
+    r'\derivative{', r'\partialderivative{',
+    # Physics package — vectors / linear algebra
+    r'\grad', r'\curl', r'\laplacian',
+    r'\divergence', r'\div{',
+    r'\tr{', r'\Tr{', r'\rank{',
+    r'\abs{', r'\norm{', r'\eval{', r'\order{',
+    r'\pqty{', r'\bqty{', r'\vqty{', r'\mqty{',
+    # Units — siunitx
+    r'\si{', r'\SI{', r'\qty{', r'\unit{', r'\num{',
+    r'\ang{', r'\pu{', r'\mol{',
+    r'\micro', r'\nano', r'\pico', r'\femto',
+    r'\kilo', r'\mega', r'\giga', r'\tera',
+    r'\ohm', r'\volt', r'\ampere', r'\watt',
+    r'\joule', r'\kelvin', r'\pascal', r'\newton',
+    r'\meter', r'\metre', r'\gram', r'\second',
+    r'\hertz', r'\tesla', r'\weber', r'\henry',
+    r'\farad', r'\coulomb', r'\mole', r'\candela',
+    r'\liter', r'\litre', r'\radian', r'\steradian',
+    r'\becquerel', r'\gray', r'\sievert',
+    r'\electronvolt', r'\dalton', r'\astronomicalunit',
+    # Fonts — unsupported
+    r'\mathbb{', r'\mathscr{', r'\mathfrak{',
+    r'\boldsymbol{', r'\bm{',
+    # Text commands
+    r'\textrm{', r'\textbf{', r'\textit{', r'\texttt{', r'\textsf{',
+    r'\textsl{', r'\textsc{', r'\emph{',
+    r'\mbox{', r'\hbox{', r'\vbox{', r'\fbox{',
+    r'\parbox{', r'\makebox{',
+    # Operators
+    r'\operatorname{', r'\DeclareMathOperator{',
+    r'\DeclarePairedDelimiter{',
+    # Spacing — unsupported
+    r'\vspace{', r'\hspace{', r'\vspace*{', r'\hspace*{',
+    r'\medspace', r'\thickspace', r'\thinspace',
+    r'\negmedspace', r'\negthickspace', r'\negthinspace',
+    # Color
+    r'\color{', r'\textcolor{', r'\colorbox{', r'\fcolorbox{',
+    r'\definecolor{', r'\setcolor{',
+    # TikZ / PGF
+    r'\tikz', r'\begin{tikz', r'\draw', r'\node', r'\path',
+    r'\fill', r'\filldraw', r'\coordinate',
+    # Document structure
+    r'\newcommand{', r'\renewcommand{', r'\providecommand{',
+    r'\newcommand ', r'\renewcommand ',  # catch custom command defs
+    r'\usepackage{', r'\documentclass{',
+    r'\section{', r'\subsection{', r'\chapter{',
+    r'\caption{', r'\footnote{', r'\marginnote{',
+    r'\label{', r'\ref{', r'\eqref{', r'\cite{',
+    r'\includegraphics',
+    # Hyperref
+    r'\href{', r'\url{', r'\hyperref{',
+    # Layout
+    r'\noindent', r'\linebreak', r'\newline', r'\newpage',
+    r'\clearpage', r'\par', r'\indent', r'\noindent',
+    # Theorem environments (preamble commands)
+    r'\newtheorem{', r'\theoremstyle{',
+    r'\qed', r'\qedhere',
+    # Other packages
+    r'\cancel{', r'\bcancel{', r'\xcancel{', r'\cancelto{',
+    r'\boxed{',  # technically supported but can cause issues
+    r'\shaded', r'\fboxrule', r'\fboxsep',
+    r'\intertext{', r'\shortintertext{',
+)
+
+def _extract_math_commands(math_content):
+    return re.findall(r'\\([a-zA-Z]+)', math_content)
+
+def _math_block_is_safe(math_content):
+    commands = _extract_math_commands(math_content)
+    return all(cmd in _MPL_SAFE_COMMANDS for cmd in commands)
+
+def _safe_mpl_text(s):
+    if not isinstance(s, str) or '$' not in s:
+        return s
+    # Fast path: blacklist
+    if any(cmd in s for cmd in _MPL_BLACKLIST):
+        return _strip_math_blocks(s)
+    # Thorough path: whitelist — extract all \commands from math blocks
+    # and check every one against the known-safe set
+    for m in re.finditer(r'\$\$(.+?)\$\$|\$(.+?)\$', s, flags=re.DOTALL):
+        content = m.group(1) or m.group(2) or ''
+        if not _math_block_is_safe(content):
+            return _strip_math_blocks(s)
+    return s
+
+def _strip_latex_inner(inner):
+    for _ in range(8):
+        inner = re.sub(r'\\[a-zA-Z]+\*?\s*\{([^{}]*)\}', r'\1', inner)
+    inner = re.sub(r'\\[a-zA-Z]+\*?', ' ', inner)
+    for ch in '{}$_^&':
+        inner = inner.replace(ch, '')
+    return ' '.join(inner.split())
+
+def _strip_math_blocks(s):
+    s = re.sub(r'\$\$(.+?)\$\$', lambda m: _strip_latex_inner(m.group(1)), s, flags=re.DOTALL)
+    s = re.sub(r'\$(.+?)\$',     lambda m: _strip_latex_inner(m.group(1)), s)
+    return s
+
+def _safe_str(s):
+    try:
+        return _safe_mpl_text(str(s)) if s is not None else ''
+    except Exception:
+        return str(s) if s is not None else ''
+
+try:
+    import matplotlib.text as _mpl_text_mod
+    import matplotlib.axes as _mpl_axes_mod
+
+    _orig_set_text = _mpl_text_mod.Text.set_text
+    def _p_set_text(self, s): return _orig_set_text(self, _safe_str(s))
+    _mpl_text_mod.Text.set_text = _p_set_text
+
+    _orig_set_title = _mpl_axes_mod.Axes.set_title
+    def _p_set_title(self, label, *a, **kw): return _orig_set_title(self, _safe_str(label), *a, **kw)
+    _mpl_axes_mod.Axes.set_title = _p_set_title
+
+    _orig_set_xlabel = _mpl_axes_mod.Axes.set_xlabel
+    def _p_set_xlabel(self, xlabel, *a, **kw): return _orig_set_xlabel(self, _safe_str(xlabel), *a, **kw)
+    _mpl_axes_mod.Axes.set_xlabel = _p_set_xlabel
+
+    _orig_set_ylabel = _mpl_axes_mod.Axes.set_ylabel
+    def _p_set_ylabel(self, ylabel, *a, **kw): return _orig_set_ylabel(self, _safe_str(ylabel), *a, **kw)
+    _mpl_axes_mod.Axes.set_ylabel = _p_set_ylabel
+
+    try:
+        from mpl_toolkits.mplot3d import axes3d as _axes3d
+        _orig_set_zlabel = _axes3d.Axes3D.set_zlabel
+        def _p_set_zlabel(self, zlabel, *a, **kw): return _orig_set_zlabel(self, _safe_str(zlabel), *a, **kw)
+        _axes3d.Axes3D.set_zlabel = _p_set_zlabel
+    except Exception:
+        pass
+
+    try:
+        import matplotlib.figure as _mpl_fig_mod
+        _orig_suptitle = _mpl_fig_mod.Figure.suptitle
+        def _p_suptitle(self, t, *a, **kw): return _orig_suptitle(self, _safe_str(t), *a, **kw)
+        _mpl_fig_mod.Figure.suptitle = _p_suptitle
+    except Exception:
+        pass
+
+except Exception as _patch_err:
+    warnings.warn('Matplotlib text sanitizer patch failed: ' + str(_patch_err))
+# -- / Matplotlib mathtext sanitizer -----------------------------------------
+
+# -- Matplotlib dash pattern sanitizer ---------------------------------------
+# Prevents: ValueError: At least one value in the dash list must be positive
+# Occurs when AI-generated code passes linestyle tuples like (0, (0, 0)) or
+# any dash sequence where all values are 0.  Also handles set_linestyle with
+# invalid (offset, onoffseq) tuples passed to patches/lines/legend handles.
+try:
+    import matplotlib.backend_bases as _mpl_bb
+
+    def _sanitize_dashes(offset, dashes):
+        # Returns safe (offset, dashes): converts all-zero/negative sequences
+        # to solid line (None); clips individual negatives to small epsilon.
+        if dashes is None:
+            return offset, None
+        try:
+            seq = list(dashes)
+        except TypeError:
+            return offset, None
+        if not seq:
+            return offset, None
+        # Clip negatives/zeros to small positive
+        fixed = [max(float(v), 1e-6) for v in seq]
+        # If all original values were effectively 0 -> solid
+        if all(v <= 0 for v in seq):
+            return 0, None
+        return offset, fixed
+
+    _orig_set_dashes = _mpl_bb.GraphicsContextBase.set_dashes
+    def _p_set_dashes(self, dash_offset, dash_list):
+        dash_offset, dash_list = _sanitize_dashes(dash_offset, dash_list)
+        return _orig_set_dashes(self, dash_offset, dash_list)
+    _mpl_bb.GraphicsContextBase.set_dashes = _p_set_dashes
+
+    # Patch Line2D.set_dashes and set_linestyle to intercept upstream
+    try:
+        import matplotlib.lines as _mpl_lines
+        _orig_line_set_dashes = _mpl_lines.Line2D.set_dashes
+        def _p_line_set_dashes(self, seq):
+            if seq is not None:
+                try:
+                    seq = [max(float(v), 1e-6) for v in seq] if any(v > 0 for v in seq) else None
+                except Exception:
+                    seq = None
+            return _orig_line_set_dashes(self, seq)
+        _mpl_lines.Line2D.set_dashes = _p_line_set_dashes
+    except Exception:
+        pass
+
+    # Patch patches.Patch._dash_pattern setter path via set_linestyle
+    try:
+        import matplotlib.patches as _mpl_patches
+        _orig_patch_set_ls = _mpl_patches.Patch.set_linestyle
+        def _p_patch_set_ls(self, ls):
+            try:
+                if isinstance(ls, tuple) and len(ls) == 2:
+                    offset, seq = ls
+                    if seq is not None:
+                        seq_list = list(seq)
+                        if seq_list and all(v <= 0 for v in seq_list):
+                            ls = '-'   # fallback to solid
+            except Exception:
+                pass
+            return _orig_patch_set_ls(self, ls)
+        _mpl_patches.Patch.set_linestyle = _p_patch_set_ls
+    except Exception:
+        pass
+
+except Exception as _dash_patch_err:
+    warnings.warn('Matplotlib dash sanitizer patch failed: ' + str(_dash_patch_err))
+# -- / Matplotlib dash pattern sanitizer -------------------------------------
+
 namespace = _SafePlotNamespace({'__name__': '__main__', '__file__': INPUT_PATH, 'OUTPUT_PATH': OUTPUT_PATH, 'PLOT_OUTPUT_PATH': OUTPUT_PATH})
 try:
     with open(INPUT_PATH, 'r', encoding='utf-8') as handle:
         source = handle.read()
     exec(compile(source, INPUT_PATH, 'exec'), namespace, namespace)
     if not os.path.exists(OUTPUT_PATH):
+        existing_output = _find_existing_output_file(OUTPUT_PATH)
+        if existing_output and os.path.abspath(existing_output) != os.path.abspath(OUTPUT_PATH):
+            import shutil as _shutil
+            _shutil.copy2(existing_output, OUTPUT_PATH)
+    if not os.path.exists(OUTPUT_PATH):
         figures = [plt.figure(num) for num in plt.get_fignums()]
         if figures:
             figures[-1].savefig(OUTPUT_PATH, dpi=170, bbox_inches='tight')
     if not os.path.exists(OUTPUT_PATH):
-        raise RuntimeError('Το plotting script ολοκληρώθηκε αλλά δεν παρήγαγε matplotlib figure.')
+        raise RuntimeError('Το plotting script ολοκληρώθηκε αλλά δεν παρήγαγε matplotlib figure ή αποθηκευμένο image output.')
     _emit_json({'ok': True, 'output_path': OUTPUT_PATH})
 except Exception as exc:
     _emit_json({'ok': False, 'error': str(exc), 'traceback': traceback.format_exc(limit=6)})
@@ -4567,8 +5136,16 @@ except Exception as exc:
         return (False, f'Αποτυχία εκτέλεσης plot renderer μέσω {python_source}: {exc}', None)
     stdout_text = str(proc.stdout or '').strip()
     stderr_text = str(proc.stderr or '').strip()
+    cleaned_stdout = '\n'.join(line for line in stdout_text.splitlines() if 'Matplotlib is building the font cache' not in line).strip()
+    cleaned_stderr = '\n'.join(line for line in stderr_text.splitlines() if 'Matplotlib is building the font cache' not in line).strip()
     if proc.returncode != 0 or (not output_path.exists()):
-        details = (stderr_text or stdout_text or 'Το plotting script δεν παρήγαγε έγκυρο αποτέλεσμα.')[:PLOT_RENDER_MAX_STDOUT_CHARS]
+        combined_details = '\n'.join(part for part in [cleaned_stderr, cleaned_stdout] if part).strip()
+        traceback_marker = 'Traceback (most recent call last):'
+        if traceback_marker in combined_details:
+            combined_details = combined_details[combined_details.find(traceback_marker):]
+        details = (combined_details or cleaned_stderr or cleaned_stdout or 'Το plotting script δεν παρήγαγε έγκυρο αποτέλεσμα.')[:PLOT_RENDER_MAX_STDOUT_CHARS]
+        if 'δεν παρήγαγε matplotlib figure' in details.lower() or 'did not produce matplotlib figure' in details.lower():
+            details += '\nΠιθανές αιτίες: το code δεν περιείχε τελικά εντολές plotting, έκλεισε όλα τα figures πριν το τέλος ή αποθήκευσε εικόνα σε μη αναμενόμενο path.'
         shutil.rmtree(session_dir, ignore_errors=True)
         return (False, details, None)
     try:
@@ -6905,16 +7482,29 @@ def serve_index_html() -> str:
     function mayContainScientificMarkup(text) {
       const source = String(text || "");
       if (!source) return false;
-      return /(\\$\\$[\\s\\S]+?\\$\\$|\\\\\\[[\\s\\S]+?\\\\\\]|\\\\\\([\\s\\S]+?\\\\\\)|\\$[^$\\n][\\s\\S]*?\\$|\\\\(?:ce|pu|frac|dfrac|tfrac|sqrt|sum|prod|int|iint|iiint|oint|lim|log|ln|sin|cos|tan|alpha|beta|gamma|delta|epsilon|varepsilon|theta|lambda|mu|pi|sigma|omega|Omega|Delta|Gamma|Sigma|partial|nabla|vec|mathbf|mathbb|mathrm|mathcal|overline|underline|hat|bar|dot|ddot|times|cdot|pm|mp|neq|approx|sim|propto|leq|geq|ll|gg|to|rightarrow|leftarrow|leftrightarrow|Rightarrow|Leftarrow|Leftrightarrow|mapsto|implies|iff|land|lor|neg|oplus|otimes|forall|exists|infty|degree|angle|triangle|square|therefore|because|equiv|parallel|perp|notin|subset|supset|subseteq|supseteq|cup|cap|vdash|models|ohm|text)\\b)/.test(source);;;
+      // Fast checks — math delimiters ($...$ και display math)
+      if (source.indexOf("$") !== -1) return true;
+      if (source.indexOf("\\\\[") !== -1 || source.indexOf("\\\\(") !== -1) return true;
+      // Έλεγχος για LaTeX commands από όλα τα πεδία επιστημών:
+      // Μαθηματικά, Φυσική, Χημεία, Βιολογία/Βιοχημεία, Ηλεκτρονική κ.λπ.
+      return /\\\\(?:frac|dfrac|tfrac|cfrac|sfrac|sqrt|binom|tbinom|dbinom|over|atop|choose|sum|prod|int|iint|iiint|oint|coprod|lim|liminf|limsup|sup|inf|max|min|det|deg|exp|log|ln|sin|cos|tan|cot|sec|csc|arcsin|arccos|arctan|sinh|cosh|tanh|alpha|beta|gamma|delta|epsilon|varepsilon|zeta|eta|theta|vartheta|iota|kappa|lambda|mu|nu|xi|pi|varpi|rho|varrho|sigma|varsigma|tau|upsilon|phi|varphi|chi|psi|omega|Gamma|Delta|Theta|Lambda|Xi|Pi|Sigma|Upsilon|Phi|Psi|Omega|partial|nabla|infty|forall|exists|nexists|emptyset|varnothing|times|cdot|pm|mp|div|ast|star|circ|bullet|oplus|ominus|otimes|odot|cap|cup|vee|wedge|setminus|subset|supset|subseteq|supseteq|notin|in|ni|leq|geq|neq|approx|equiv|propto|sim|simeq|prec|succ|ll|gg|perp|parallel|cong|asymp|rightarrow|leftarrow|leftrightarrow|Rightarrow|Leftarrow|Leftrightarrow|to|mapsto|implies|iff|longrightarrow|longleftarrow|uparrow|downarrow|therefore|because|angle|triangle|square|vec|hat|bar|dot|ddot|dddot|tilde|acute|grave|breve|check|widehat|widetilde|overline|underline|overbrace|underbrace|overset|underset|stackrel|overleftarrow|overrightarrow|overleftrightarrow|mathrm|mathit|mathbf|mathtt|mathsf|mathcal|mathbb|mathscr|mathfrak|boldsymbol|bm|textbf|textit|textrm|emph|ce|cee|cf|bra|ket|braket|ketbra|mel|ev|comm|acomm|pdv|dv|fdv|grad|curl|div|laplacian|divergence|abs|norm|eval|order|tr|Tr|rank|erf|si|SI|qty|unit|num|ang|pu|mol|begin|end|left|right|big|bigg|Big|Bigg|hbar|ell|wp|Re|Im|aleph|beth|daleth|gimel|deg|ohm|text|mbox|operatorname|cancel|bcancel|xcancel|cancelto|boxed|color|textcolor)\\b/.test(source);
     }
 
     function renderMathInElementSafe(root) {
       if (!root) return;
 
       if (window.MathJax && typeof window.MathJax.typesetPromise === "function") {
+        // Generation counter: αν το περιεχόμενο άλλαξε μέχρι να εκτελεστεί
+        // αυτό το render (π.χ. λόγω streaming), το παραλείπουμε ώστε να αποφύγουμε
+        // συσσώρευση stale renders στο queue κατά τη διάρκεια streaming.
+        root.__mathGen = ((root.__mathGen || 0) + 1) | 0;
+        const _myGen = root.__mathGen;
         mathTypesetQueue = mathTypesetQueue
           .catch(() => undefined)
-          .then(() => window.MathJax.typesetPromise([root]))
+          .then(() => {
+            if ((root.__mathGen || 0) !== _myGen) return; // stale — skip
+            return window.MathJax.typesetPromise([root]);
+          })
           .catch((err) => {
             console.warn("MathJax render failed:", err);
           });
@@ -7474,7 +8064,7 @@ def serve_index_html() -> str:
       if (!source || source.indexOf("<svg") === -1 || source.indexOf("</svg>") === -1) return [source];
 
       const parts = [];
-      const regex = /<svg\b[\\s\\S]*?<\\/svg>/ig;
+      const regex = /<svg\\b[\\s\\S]*?<\\/svg>/ig;
       let lastIndex = 0;
       let match;
       while ((match = regex.exec(source)) !== null) {
@@ -7533,11 +8123,15 @@ def serve_index_html() -> str:
       const forceNow = Boolean(options.forceMathPreview);
       const now = Date.now();
       let entry = liveMathRenderState.get(container);
-      if (!entry) entry = { timer: 0, lastRun: 0 };
+      if (!entry) entry = { timer: 0, lastRun: 0, lastText: "" };
+
+      // Skip render αν το text δεν άλλαξε από την τελευταία render
+      if (!forceNow && sourceText === entry.lastText && entry.lastRun > 0) return;
 
       const run = () => {
         entry.timer = 0;
         entry.lastRun = Date.now();
+        entry.lastText = sourceText;
         try {
           renderMathInElementSafe(container);
         } catch (_) {}
@@ -7546,17 +8140,18 @@ def serve_index_html() -> str:
 
       const elapsed = now - Number(entry.lastRun || 0);
       if (forceNow || elapsed >= minInterval) {
-        if (entry.timer) {
-          clearTimeout(entry.timer);
-          entry.timer = 0;
-        }
+        if (entry.timer) { clearTimeout(entry.timer); entry.timer = 0; }
         run();
         return;
       }
 
-      if (!entry.timer) {
-        entry.timer = window.setTimeout(run, Math.max(24, minInterval - elapsed));
+      // Debounce: αν έχει ήδη προγραμματιστεί timer, απλά ενημέρωσε το sourceText
+      if (entry.timer) {
+        entry.lastText = ""; // force re-render when timer fires
+        liveMathRenderState.set(container, entry);
+        return;
       }
+      entry.timer = window.setTimeout(run, Math.max(24, minInterval - elapsed));
       liveMathRenderState.set(container, entry);
     }
 
@@ -7646,6 +8241,10 @@ def serve_index_html() -> str:
     }
 
     const STREAM_RENDER_MIN_INTERVAL_MS = 95;
+    // Πόσο συχνά (ms) να τρέχει το math render ΚΑΤΑ ΤΗ ΔΙΑΡΚΕΙΑ streaming.
+    // Αρκετά αραιό ώστε να μην φράξει το MathJax/KaTeX queue, αρκετά πυκνό
+    // ώστε ο χρήστης να βλέπει τους συμβολισμούς real-time.
+    const STREAM_LIVE_MATH_INTERVAL_MS = 480;
 
     function ensureAssistantStreamingPreviewNode(container) {
       if (!container) return null;
@@ -7698,11 +8297,20 @@ def serve_index_html() -> str:
       const sourceText = String(content || "");
       if (!container) return sourceText;
       container.dataset.rawContent = sourceText;
+      // DOM ανανεώνεται γρήγορα χωρίς inline math (skipMathRender:true).
+      // Το math rendering γίνεται χωριστά μέσω scheduleLiveScientificRender
+      // ώστε να τρέχει throttled/debounced και να φαίνεται real-time.
       renderMessageContent(container, sourceText, {
         skipMathRender: true,
         liveMathPreview: false,
         forceStreamingPreview: true,
       });
+      // Live math rendering κατά το streaming — throttled
+      if (mayContainScientificMarkup(sourceText)) {
+        scheduleLiveScientificRender(container, sourceText, {
+          liveMathIntervalMs: STREAM_LIVE_MATH_INTERVAL_MS,
+        });
+      }
       return sourceText;
     }
 
@@ -9308,6 +9916,14 @@ def serve_index_html() -> str:
             } else if (payload.type === "error") {
               throw new Error(payload.error || "Άγνωστο σφάλμα.");
             } else if (payload.type === "done") {
+              // Αν το μοντέλο ολοκλήρωσε thinking αλλά δεν έδωσε απάντηση,
+              // το server θα έχει ήδη στείλει fallback delta.  Ως δεύτερη
+              // γραμμή άμυνας, αν finalText είναι ακόμα κενό εδώ, εμφανίζουμε
+              // ένα client-side fallback ώστε ο χρήστης να μη βλέπει κενή απάντηση.
+              if (!finalText.trim() && finalThinking.trim()) {
+                finalText = "\u26a0\ufe0f Το μοντέλο ολοκλήρωσε τη σκέψη αλλά δεν παρήγαγε κείμενο απάντησης. " +
+                            "Δοκίμασε να απενεργοποιήσεις το Deep Thinking ή να χρησιμοποιήσεις μοντέλο με μεγαλύτερο context.";
+              }
               renderAssistantStreamingView(finalText, finalThinking, true);
               if (payload.elapsed_sec != null) {
                 completionText = `✅ ${payload.elapsed_sec.toFixed(2)}s`;
@@ -10395,9 +11011,24 @@ class AppHandler(BaseHTTPRequestHandler):
                         token_stats = stats
                 if collected_thinking and (not thinking_done_sent) and (not suppress_reasoning_output):
                     stream_json_line(self, {'type': 'thinking_done'})
+                    thinking_done_sent = True
                 assistant_text = ''.join(collected).strip()
                 assistant_text = strip_inline_think_blocks(assistant_text) if suppress_reasoning_output else assistant_text
                 assistant_thinking = '' if suppress_reasoning_output else ''.join(collected_thinking).strip()
+                # Το μοντέλο ολοκλήρωσε το thinking αλλά δεν παρήγαγε κείμενο απάντησης.
+                # Αυτό συμβαίνει συνήθως όταν εξαντλήθηκαν τα tokens ή το μοντέλο
+                # δεν υποστηρίζει σωστά το think mode.  Στέλνουμε fallback μήνυμα.
+                if assistant_thinking and (not assistant_text):
+                    _thinking_fallback = (
+                        '\u26a0\ufe0f **Το μοντέλο ολοκλήρωσε τη σκέψη αλλά δεν παρήγαγε κείμενο απάντησης.**\n\n'
+                        'Πιθανές αιτίες:\n'
+                        '- Εξαντλήθηκαν τα tokens (το deep thinking κατανάλωσε όλο το context window)\n'
+                        '- Το μοντέλο δεν υποστηρίζει πλήρως το think mode με την τρέχουσα ρύθμιση\n\n'
+                        'Δοκίμασε: απενεργοποίησε το **Deep Thinking** ή χρησιμοποίησε '
+                        'μοντέλο με μεγαλύτερο context window.'
+                    )
+                    stream_json_line(self, {'type': 'delta', 'content': _thinking_fallback})
+                    assistant_text = _thinking_fallback
                 if not assistant_text and (not assistant_thinking):
                     raise RuntimeError('Το μοντέλο δεν επέστρεψε περιεχόμενο. Έλεγξε το API key από το GUI/settings file και αν το μοντέλο είναι διαθέσιμο στο direct cloud catalog.')
                 assistant_display_text = compose_display_assistant_text(assistant_text, assistant_thinking)
@@ -10574,7 +11205,7 @@ def _patch_svg_preview_in_index_html(html_doc: str) -> str:
     helper_insert = r'''    function looksLikeSvgContent(text) {
       const source = String(text || "").trim();
       if (!source) return false;
-      return /^<svg\b[\s\S]*<\/svg>$/i.test(source);
+      return /^<svg\\b[\s\S]*<\/svg>$/i.test(source);
     }
 
     function isSvgLanguage(language) {
@@ -10882,7 +11513,7 @@ def _patch_svg_preview_in_index_html(html_doc: str) -> str:
       if (!source || source.indexOf("<svg") === -1 || source.indexOf("</svg>") === -1) return [source];
 
       const parts = [];
-      const regex = /<svg\b[\s\S]*?<\/svg>/ig;
+      const regex = /<svg\\b[\s\S]*?<\/svg>/ig;
       let lastIndex = 0;
       let match;
       while ((match = regex.exec(source)) !== null) {
@@ -13557,8 +14188,6 @@ def _build_assistant_pdf_document(html_fragment: str, theme: str='light', docume
 
     return html_doc
 
-if __name__ == '__main__':
-    main()
 
 
 _previous_serve_index_html_with_svg_force_runtime = serve_index_html
@@ -13578,7 +14207,7 @@ def _patch_svg_force_runtime_in_index_html(html_doc: str) -> str:
 
   function looksLikeSvgContent(text) {
     const source = String(text || '').trim();
-    return /^<svg\b[\s\S]*<\/svg>$/i.test(source);
+    return /^<svg\\b[\s\S]*<\/svg>$/i.test(source);
   }
 
   function isSvgLanguage(language) {
@@ -13899,7 +14528,7 @@ def _patch_svg_force_runtime_in_index_html(html_doc: str) -> str:
     if (!source || source.indexOf('<svg') === -1 || source.indexOf('</svg>') === -1) return [source];
 
     const parts = [];
-    const regex = /<svg\b[\s\S]*?<\/svg>/ig;
+    const regex = /<svg\\b[\s\S]*?<\/svg>/ig;
     let lastIndex = 0;
     let match;
     while ((match = regex.exec(source)) !== null) {
@@ -14045,4 +14674,8 @@ def _patch_svg_force_runtime_in_index_html(html_doc: str) -> str:
 
 def serve_index_html() -> str:
     """Τελικό index HTML με αναγκαστικό runtime SVG preview fix."""
-    return _patch_svg_force_runtime_in_index_html(_previous_serve_index_html_with_svg_force_runtime())
+    html_doc = _patch_svg_force_runtime_in_index_html(_previous_serve_index_html_with_svg_force_runtime())
+    return html_doc.replace("\x08", r"\b")
+
+if __name__ == '__main__':
+    main()
