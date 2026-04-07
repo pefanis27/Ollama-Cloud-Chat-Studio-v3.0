@@ -37,8 +37,6 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
-import concurrent.futures
-import multiprocessing
 logging.basicConfig(level=logging.INFO, format='%(asctime)s  %(levelname)-8s  %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
 APP_TITLE = 'Ollama Cloud Chat Studio v4.0'
@@ -612,10 +610,7 @@ def save_app_config_to_disk(ollama_api_key: Optional[str]=None, active_prompt_pr
     tmp_path = APP_CONFIG_FILE.with_suffix('.tmp')
     try:
         tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
-        # Σε Windows το os.replace δεν επιτρέπεται αν το target υπάρχει σε ορισμένες εκδόσεις
-        if os.name == 'nt' and APP_CONFIG_FILE.exists():
-            APP_CONFIG_FILE.unlink()
-        tmp_path.replace(APP_CONFIG_FILE)
+        os.replace(tmp_path, APP_CONFIG_FILE)
     except Exception:
         try:
             tmp_path.unlink(missing_ok=True)
@@ -1503,20 +1498,10 @@ def get_or_fetch_model_meta(model: str, force: bool=False) -> Dict[str, object]:
             existing = copy.deepcopy(entry)
         return existing
     with REGISTRY.lock:
-        merge_model_meta(REGISTRY.model_meta, {cleaned_model: fresh_meta})
         entry = REGISTRY.model_meta.setdefault(cleaned_model, {})
+        _overwrite_model_meta_entry(entry, fresh_meta)
         entry['details_complete'] = True
         entry.pop('details_error', None)
-        if fresh_meta.get('capabilities'):
-            entry['capabilities'] = list(fresh_meta.get('capabilities', []))
-        if fresh_meta.get('modified_at'):
-            entry['modified_at'] = fresh_meta.get('modified_at')
-        if fresh_meta.get('modified_ts'):
-            entry['modified_ts'] = fresh_meta.get('modified_ts')
-        if fresh_meta.get('parameter_size_b'):
-            entry['parameter_size_b'] = fresh_meta.get('parameter_size_b')
-        if fresh_meta.get('parameter_count'):
-            entry['parameter_count'] = fresh_meta.get('parameter_count')
         return copy.deepcopy(entry)
 
 def merge_model_meta(dest: Dict[str, Dict[str, object]], src: Dict[str, Dict[str, object]]) -> None:
@@ -1537,6 +1522,18 @@ def merge_model_meta(dest: Dict[str, Dict[str, object]], src: Dict[str, Dict[str
                     entry[key] = incoming
             else:
                 entry.setdefault(key, value)
+
+def _overwrite_model_meta_entry(entry: Dict[str, object], fresh_info: Dict[str, object]) -> None:
+    """Ενημερώνει ένα metadata entry με φρέσκες, μη κενές τιμές χωρίς να χάνει τα max-based πεδία."""
+    if not isinstance(entry, dict) or not isinstance(fresh_info, dict):
+        return
+    for key, value in fresh_info.items():
+        if value in (None, '', 0):
+            continue
+        if key == 'num_ctx_max':
+            entry[key] = max(int(entry.get(key) or 0), int(value or 0))
+            continue
+        entry[key] = copy.deepcopy(value)
 
 def fetch_cloud_models_for_family(family: str, timeout: int=8, family_candidates: Optional[Set[str]]=None) -> Tuple[List[str], Dict[str, Dict[str, object]]]:
     """Κατεβάζει cloud model tags για ένα συγκεκριμένο family από τις σελίδες βιβλιοθήκης του Ollama."""
@@ -2220,6 +2217,19 @@ def _extract_primary_style_block(html_doc: str) -> str:
     match = re.search(r'<style>\s*(.*?)\s*</style>', html_doc, flags=re.DOTALL | re.IGNORECASE)
     return match.group(1).strip() if match else ''
 
+_INDEX_HTML_CACHE: Optional[str] = None
+_INDEX_HTML_PRIMARY_STYLE_CACHE: Optional[str] = None
+_INDEX_HTML_CACHE_LOCK = threading.Lock()
+
+def _get_cached_index_html_primary_style_block() -> str:
+    """Επιστρέφει cached το κύριο CSS block του index HTML χωρίς να το ξαναχτίζει σε κάθε export."""
+    global _INDEX_HTML_PRIMARY_STYLE_CACHE
+    cached = _INDEX_HTML_PRIMARY_STYLE_CACHE
+    if cached is not None:
+        return cached
+    serve_index_html()
+    return _INDEX_HTML_PRIMARY_STYLE_CACHE or ''
+
 def _sanitize_mathjax_svg_cache_fragment(fragment: str) -> str:
     """Κρατά μόνο ασφαλές inline SVG cache markup της MathJax για να μη χάνονται glyphs στο PDF."""
     text = str(fragment or '').strip()
@@ -2359,7 +2369,7 @@ def _build_assistant_pdf_document(html_fragment: str, theme: str='light', docume
     ανεξάρτητα από το active theme του UI. Έτσι αποφεύγονται σκούρα margins/containers
     όταν ο χρήστης βρίσκεται σε Dark Theme."""
     normalized_theme = 'light'
-    base_css = _extract_primary_style_block(serve_index_html())
+    base_css = _get_cached_index_html_primary_style_block()
     prism_theme = 'https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-solarizedlight.min.css'
     title_text = html.escape(str(document_title or 'Assistant response'))
     fragment = str(html_fragment or '').strip()
@@ -4745,7 +4755,7 @@ _MPL_SAFE_COMMANDS = frozenset({
     # Στατιστικές συναρτήσεις
     'Var','Cov','Corr','Bias','MSE',  # ως \mathrm ή text operators
     # Βιοχημεία / ενζυμικές (ως text)
-    'mod','rem','gcd','lcm',
+    'mod','rem','lcm',
 
     # ════════════════════════════════════════════════════════════════════════
     # FONTS — ΥΠΟΣΤΗΡΙΖΟΜΕΝΑ ΑΠΟ MATPLOTLIB
@@ -4891,8 +4901,7 @@ _MPL_BLACKLIST = (
     r'\DeclarePairedDelimiter{',
     # Spacing — unsupported
     r'\vspace{', r'\hspace{', r'\vspace*{', r'\hspace*{',
-    r'\medspace', r'\thickspace', r'\thinspace',
-    r'\negmedspace', r'\negthickspace', r'\negthinspace',
+    r'\negmedspace', r'\negthickspace',
     # Color
     r'\color{', r'\textcolor{', r'\colorbox{', r'\fcolorbox{',
     r'\definecolor{', r'\setcolor{',
@@ -11281,6 +11290,19 @@ def _run_initialization(args: argparse.Namespace, port: int) -> None:
     refresh_models_in_background(force=True)
 
 
+def _inject_css_into_index_html(html_doc: str, css_insert: str, *, anchor: str='    .attachment-chip\n') -> str:
+    """Εισάγει CSS στο κύριο <style> block με fallback αν αλλάξει το anchor selector."""
+    html_doc = str(html_doc or '')
+    css_insert = str(css_insert or '')
+    if not html_doc or not css_insert:
+        return html_doc
+    if anchor and anchor in html_doc:
+        return html_doc.replace(anchor, css_insert + anchor, 1)
+    style_close = html_doc.find('</style>')
+    if style_close != -1:
+        return html_doc[:style_close] + css_insert + html_doc[style_close:]
+    return html_doc + '\n<style>\n' + css_insert + '\n</style>'
+
 def _patch_svg_preview_in_index_html(html_doc: str) -> str:
     """Μετατρέπει fenced SVG blocks σε κανονικό preview εικόνας μέσα στο chat."""
     html_doc = str(html_doc or '')
@@ -11716,7 +11738,7 @@ def _patch_svg_preview_in_index_html(html_doc: str) -> str:
     }'''
 
     if '.svg-block {' not in html_doc:
-        html_doc = html_doc.replace('    .attachment-chip {\n', css_insert + '    .attachment-chip {\n', 1)
+        html_doc = _inject_css_into_index_html(html_doc, css_insert, anchor='    .attachment-chip {\n')
 
     if 'function looksLikeSvgContent(text)' not in html_doc:
         html_doc = html_doc.replace(
@@ -11803,8 +11825,8 @@ def _patch_pdf_export_in_index_html(html_doc: str) -> str:
     }
 
 '''
-    if '.pdf-export-host {' not in html_doc and css_anchor in html_doc:
-        html_doc = html_doc.replace(css_anchor, css_insert + css_anchor, 1)
+    if '.pdf-export-host {' not in html_doc:
+        html_doc = _inject_css_into_index_html(html_doc, css_insert, anchor=css_anchor)
 
     helper_anchor = '    function createMessage(role, content, attachments = []) {\n'
     helper_insert = r'''    function sanitizePdfFilenamePart(value, fallback = "export") {
@@ -13393,8 +13415,8 @@ def _patch_math_display_blocks_in_index_html(html_doc: str) -> str:
 
     css_anchor = '    .attachment-chip {\n'
     css_insert = "    .math-display-raw {\n      display: block;\n      width: 100%;\n      overflow-x: auto;\n      padding: 2px 0;\n    }\n\n"
-    if '.math-display-raw {' not in html_doc and css_anchor in html_doc:
-        html_doc = html_doc.replace(css_anchor, css_insert + css_anchor, 1)
+    if '.math-display-raw {' not in html_doc:
+        html_doc = _inject_css_into_index_html(html_doc, css_insert, anchor=css_anchor)
 
     helper_anchor = '    function markdownToHtml(rawText) {\n'
     helper_insert = r"""    function protectDisplayMathBlocks(rawText) {
@@ -15058,7 +15080,7 @@ def _patch_markdown_spacing_in_index_html(html_doc: str) -> str:
     if (window.__markdownSpacingFixInstalled) return;
     window.__markdownSpacingFixInstalled = true;
 
-    markdownToHtml = function markdownToHtmlPatched(rawText) {
+    window.markdownToHtml = function markdownToHtmlPatched(rawText) {
       const protectedMath = (typeof protectDisplayMathBlocks === 'function')
         ? protectDisplayMathBlocks(rawText)
         : { text: String(rawText || ''), blocks: [] };
@@ -15177,7 +15199,6 @@ def _patch_markdown_spacing_in_index_html(html_doc: str) -> str:
       return out.join("\n");
     };
 
-    window.markdownToHtml = markdownToHtml;
   }
 
   if (document.readyState === 'loading') {
@@ -15197,8 +15218,25 @@ def _patch_markdown_spacing_in_index_html(html_doc: str) -> str:
 
 
 def serve_index_html() -> str:
-    """Τελικό index HTML με fix για τεχνητά κενά στις απαντήσεις."""
-    return _patch_markdown_spacing_in_index_html(_previous_serve_index_html_spacing_fix_v7())
+    """Επιστρέφει cached το τελικό index HTML, χτισμένο μία φορά με όλα τα patch passes."""
+    global _INDEX_HTML_CACHE, _INDEX_HTML_PRIMARY_STYLE_CACHE
+    cached = _INDEX_HTML_CACHE
+    if cached is not None:
+        return cached
+    with _INDEX_HTML_CACHE_LOCK:
+        if _INDEX_HTML_CACHE is None:
+            html_doc = _original_serve_index_html()
+            html_doc = _patch_svg_preview_in_index_html(html_doc)
+            html_doc = _patch_pdf_export_in_index_html(html_doc)
+            html_doc = _patch_math_display_blocks_in_index_html(html_doc)
+            html_doc = _patch_local_assets_and_math_fonts_in_index_html(html_doc)
+            html_doc = _patch_svg_force_runtime_in_index_html(html_doc)
+            html_doc = _patch_stable_live_scientific_streaming_in_index_html(html_doc)
+            html_doc = _patch_startup_and_js_escape_issues_in_index_html(html_doc)
+            html_doc = _patch_markdown_spacing_in_index_html(html_doc)
+            _INDEX_HTML_CACHE = html_doc
+            _INDEX_HTML_PRIMARY_STYLE_CACHE = _extract_primary_style_block(html_doc)
+        return _INDEX_HTML_CACHE
 
 
 if __name__ == '__main__':
