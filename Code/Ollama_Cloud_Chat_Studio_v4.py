@@ -8,12 +8,14 @@ from __future__ import annotations
 import argparse
 import base64
 import ast
+import concurrent.futures
 import copy
 import datetime
 import html
 import io
 import json
 import logging
+import multiprocessing
 import os
 import queue as _queue
 import re
@@ -35,6 +37,8 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
+import concurrent.futures
+import multiprocessing
 logging.basicConfig(level=logging.INFO, format='%(asctime)s  %(levelname)-8s  %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
 APP_TITLE = 'Ollama Cloud Chat Studio v4.0'
@@ -46,7 +50,18 @@ BROWSER_SESSION_HEARTBEAT_STALE_SECONDS = 30.0
 BROWSER_SESSION_WATCHDOG_POLL_SECONDS = 2.0
 BROWSER_SESSION_REQUIRE_HEARTBEAT = False
 EMBEDDED_OLLAMA_API_KEY = ''
-BASE_DIR = Path(__file__).resolve().parent
+
+def _compute_base_dir() -> Path:
+    """Επιστρέφει το σωστό base directory για data files.
+    Σε .py: φάκελος του script. Σε PyInstaller .exe: φάκελος δίπλα στο .exe."""
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).resolve().parent
+    try:
+        return Path(__file__).resolve().parent
+    except NameError:
+        return Path(sys.argv[0]).resolve().parent
+
+BASE_DIR = _compute_base_dir()
 UPLOADS_DIR = BASE_DIR / '_chat_uploads'
 GENERATED_CODE_DIR = BASE_DIR / '_generated_code_blocks'
 GENERATED_MEDIA_DIR = BASE_DIR / '_generated_media'
@@ -597,6 +612,9 @@ def save_app_config_to_disk(ollama_api_key: Optional[str]=None, active_prompt_pr
     tmp_path = APP_CONFIG_FILE.with_suffix('.tmp')
     try:
         tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+        # Σε Windows το os.replace δεν επιτρέπεται αν το target υπάρχει σε ορισμένες εκδόσεις
+        if os.name == 'nt' and APP_CONFIG_FILE.exists():
+            APP_CONFIG_FILE.unlink()
         tmp_path.replace(APP_CONFIG_FILE)
     except Exception:
         try:
@@ -1641,7 +1659,7 @@ def extract_verified_cloud_models_for_family_from_html(html_text: str, family: s
 
 def fetch_official_cloud_catalog(timeout_per_request: int=8) -> Tuple[List[str], Dict[str, Dict[str, object]]]:
     """Ανακτά την πλήρη λίστα official cloud μοντέλων συνδυάζοντας /api/tags και scraping HTML."""
-    import concurrent.futures
+    # concurrent.futures already imported at top level
     direct_models, direct_meta = fetch_direct_api_models(timeout=max(6, timeout_per_request))
     if not direct_models:
         raise RuntimeError('Δεν βρέθηκαν official direct API models από το Ollama.')
@@ -1985,7 +2003,13 @@ def resolve_python_for_generated_scripts() -> Tuple[Optional[List[str]], str]:
     if not getattr(sys, 'frozen', False):
         exe = os.path.normpath(sys.executable or 'python')
         return ([exe], 'sys.executable')
-    candidates: List[Tuple[List[str], str]] = [(['py', '-3'], 'Python Launcher (py -3)'), (['python'], 'system python'), (['python3'], 'system python3')]
+    candidates: List[Tuple[List[str], str]] = [
+        (['py', '-3'], 'Python Launcher (py -3)'),
+        (['python3'], 'system python3'),
+        (['python'], 'system python'),
+        # Αναζήτηση python.exe δίπλα στο .exe (χρήσιμο αν ο χρήστης έχει portable Python)
+        ([str(Path(sys.executable).parent / 'python.exe')], 'portable python beside exe'),
+    ]
     creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0
     for command, label in candidates:
         try:
@@ -4550,8 +4574,12 @@ plt.show = _patched_show
 # Αποτέλεσμα: κανένα άγνωστο LaTeX command δεν φτάνει στο mathtext parser.
 
 # ── Whitelist: ΟΛΑ τα commands που υποστηρίζει το matplotlib mathtext ──────
+# Κατηγορίες: Μαθηματικά, Φυσική, Χημεία (mhchem εκτός), Βιολογία/Βιοχημεία,
+#             Ηλεκτρολογία/Ηλεκτρονική, Ψηφιακά Ηλεκτρονικά, Στατιστική
 _MPL_SAFE_COMMANDS = frozenset({
-    # ── Ελληνικά πεζά ──────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # ΕΛΛΗΝΙΚΑ ΓΡΑΜΜΑΤΑ — ΠΕΖΑ
+    # ════════════════════════════════════════════════════════════════════════
     'alpha','beta','gamma','delta','epsilon','varepsilon','zeta','eta',
     'theta','vartheta','iota','kappa','lambda','mu','nu','xi',
     'pi','varpi','rho','varrho','sigma','varsigma','tau','upsilon',
@@ -4559,15 +4587,31 @@ _MPL_SAFE_COMMANDS = frozenset({
     # ── Ελληνικά κεφαλαία ─────────────────────────────────────────────────
     'Gamma','Delta','Theta','Lambda','Xi','Pi','Sigma','Upsilon',
     'Phi','Psi','Omega',
-    # ── Δομή εκφράσεων ────────────────────────────────────────────────────
+    # ── Παραλλαγές ────────────────────────────────────────────────────────
+    'digamma','varkappa','Bbbk',
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ΔΟΜΗ ΕΚΦΡΑΣΕΩΝ — ΚΛΑΣΜΑΤΑ, ΡΙΖΕΣ, ΑΘΡΟΙΣΜΑΤΑ, ΟΛΟΚΛΗΡΩΜΑΤΑ
+    # ════════════════════════════════════════════════════════════════════════
+    # Κλάσματα
     'frac','dfrac','tfrac','cfrac','sfrac',
+    # Ρίζες
     'sqrt','root',
+    # Δομή χωρίς \frac
     'over','atop','choose','binom','tbinom','dbinom',
-    # ── Μεγάλοι τελεστές ──────────────────────────────────────────────────
+    # Environments (controlled by _MPL_SAFE_ENVS - δεν μπαίνουν εδώ)
+    'begin','end',  # επιτρέπονται μόνο για supported envs (έλεγχος στο _math_block_is_safe)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ΜΕΓΑΛΟΙ ΤΕΛΕΣΤΕΣ
+    # ════════════════════════════════════════════════════════════════════════
     'sum','prod','int','oint','iint','iiint','iiiint','idotsint','coprod',
     'biguplus','bigcup','bigcap','bigodot','bigotimes','bigoplus',
     'bigvee','bigwedge','bigsqcup',
-    # ── Σχέσεις — βασικές ─────────────────────────────────────────────────
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ΣΧΕΣΕΙΣ — ΒΑΣΙΚΕΣ
+    # ════════════════════════════════════════════════════════════════════════
     'leq','le','geq','ge','neq','ne','equiv','propto',
     'approx','approxeq','thickapprox','sim','simeq','thicksim',
     'prec','succ','preceq','succeq','precsim','succsim',
@@ -4576,7 +4620,7 @@ _MPL_SAFE_COMMANDS = frozenset({
     'sqsubset','sqsupset','in','notin','ni','owns',
     'perp','parallel','cong','asymp','smile','frown',
     'between','ll','gg','doteq','models','vdash','dashv','mid',
-    # ── Σχέσεις — AMS ─────────────────────────────────────────────────────
+    # ── AMS σχέσεις ───────────────────────────────────────────────────────
     'lesssim','gtrsim','lessapprox','gtrapprox',
     'lessgtr','gtrless','lesseqgtr','gtreqless',
     'eqless','eqgtr','eqslantless','eqslantgtr',
@@ -4593,7 +4637,10 @@ _MPL_SAFE_COMMANDS = frozenset({
     'triangleq','circeq','risingdotseq','fallingdotseq','doteqdot',
     'eqcirc','bumpeq','Bumpeq','backsim','backsimeq',
     'shortmid','shortparallel','pitchfork',
-    # ── Βέλη ──────────────────────────────────────────────────────────────
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ΒΕΛΗ
+    # ════════════════════════════════════════════════════════════════════════
     'leftarrow','rightarrow','Leftarrow','Rightarrow',
     'leftrightarrow','Leftrightarrow','to','gets',
     'uparrow','downarrow','Uparrow','Downarrow',
@@ -4612,7 +4659,12 @@ _MPL_SAFE_COMMANDS = frozenset({
     'Lsh','Rsh','looparrowleft','looparrowright',
     'twoheadleftarrow','twoheadrightarrow',
     'leftarrowtail','rightarrowtail',
-    # ── Δυαδικοί τελεστές ─────────────────────────────────────────────────
+    # implies / iff (χρήσιμα στη Λογική)
+    'implies','iff',
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ΔΥΑΔΙΚΟΙ ΤΕΛΕΣΤΕΣ
+    # ════════════════════════════════════════════════════════════════════════
     'pm','mp','times','div','cdot','ast','star','circ','bullet',
     'cap','cup','vee','wedge','lor','land',
     'oplus','ominus','otimes','oslash','odot','boxplus','boxminus',
@@ -4625,7 +4677,10 @@ _MPL_SAFE_COMMANDS = frozenset({
     'intercal','veebar','barwedge','doublebarwedge',
     'curlyvee','curlywedge','circleddash','circledast','circledcirc',
     'centerdot','divideontimes',
-    # ── Διάφορα σύμβολα ───────────────────────────────────────────────────
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ΔΙΑΦΟΡΑ ΣΥΜΒΟΛΑ — ΓΕΝΙΚΑ
+    # ════════════════════════════════════════════════════════════════════════
     'infty','partial','nabla','forall','exists','nexists',
     'emptyset','varnothing','wp','Re','Im','ell','hbar','hslash',
     'imath','jmath','angle','measuredangle','sphericalangle',
@@ -4635,70 +4690,166 @@ _MPL_SAFE_COMMANDS = frozenset({
     'clubsuit','diamondsuit','heartsuit','spadesuit',
     'aleph','beth','daleth','gimel',
     'mho','eth','complement','Finv','Game',
-    'digamma','varkappa','Bbbk',
     'square','blacksquare','lozenge','blacklozenge',
     'triangle','blacktriangle','triangledown','blacktriangledown',
     'blacktriangleleft','blacktriangleright','bigstar',
     'therefore','because',
     'checkmark','maltese','circledS','yen','euro','EurAlt',
     'copyright','pounds','cent',
-    # ── Τελείες ───────────────────────────────────────────────────────────
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ΤΕΛΕΙΕΣ
+    # ════════════════════════════════════════════════════════════════════════
     'ldots','cdots','vdots','ddots','hdots','ldotp','cdotp',
-    # ── Τόνοι / accents ───────────────────────────────────────────────────
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ΤΟΝΟΙ / ACCENTS (κρίσιμα για Φυσική, Στατιστική, Ηλεκτρολογία)
+    # ════════════════════════════════════════════════════════════════════════
+    # Βασικοί
     'hat','check','tilde','acute','grave','dot','ddot','dddot','ddddot',
     'breve','bar','vec',
+    # Ευρεία
     'widehat','widetilde','wideparen',
+    # Over/under
     'overline','underline',
     'overleftarrow','overrightarrow','overleftrightarrow',
     'underleftarrow','underrightarrow','underleftrightarrow',
     'overbrace','underbrace',
     'overset','underset','stackrel','buildrel',
     'xlongequal',
-    # ── Παρενθέσεις / delimiters ──────────────────────────────────────────
-    'left','right',
+    # Πάνω από σύμβολο (χρήσιμο στα Ψηφιακά: \overline{Q})
+    'overbar',  # alias για overline σε ορισμένα contexts
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ΠΑΡΕΝΘΕΣΕΙΣ / DELIMITERS
+    # ════════════════════════════════════════════════════════════════════════
+    'left','right','middle',  # \middle| σε conditional probability
     'big','Big','bigg','Bigg',
     'bigl','bigr','Bigl','Bigr','biggl','biggr','Biggl','Biggr',
     'lfloor','rfloor','lceil','rceil','langle','rangle',
     'lgroup','rgroup','lmoustache','rmoustache',
     'lvert','rvert','lVert','rVert',
+    'vert','Vert',  # \vert = |, \Vert = ||
     'ulcorner','urcorner','llcorner','lrcorner',
-    # ── Μαθηματικές συναρτήσεις ───────────────────────────────────────────
-    'arccos','arcsin','arctan','cos','cosh','cot','coth','csc',
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ΜΑΘΗΜΑΤΙΚΕΣ ΣΥΝΑΡΤΗΣΕΙΣ
+    # ════════════════════════════════════════════════════════════════════════
+    'arccos','arcsin','arctan','arcsinh','arccosh','arctanh',
+    'cos','cosh','cot','coth','csc','csch',
     'deg','det','dim','exp','gcd','hom','inf','ker',
     'lg','lim','liminf','limsup','ln','log','max','min',
-    'Pr','sec','sin','sinh','sup','tan','tanh',
+    'Pr','sec','sech','sin','sinh','sup','tan','tanh',
     'injlim','projlim','varlimsup','varliminf','varinjlim','varprojlim',
     'arg','erf','erfc','sgn',
-    # ── Fonts (supported by matplotlib) ───────────────────────────────────
+    # Στατιστικές συναρτήσεις
+    'Var','Cov','Corr','Bias','MSE',  # ως \mathrm ή text operators
+    # Βιοχημεία / ενζυμικές (ως text)
+    'mod','rem','gcd','lcm',
+
+    # ════════════════════════════════════════════════════════════════════════
+    # FONTS — ΥΠΟΣΤΗΡΙΖΟΜΕΝΑ ΑΠΟ MATPLOTLIB
+    # ════════════════════════════════════════════════════════════════════════
     'mathrm','mathit','mathbf','mathtt','mathsf','mathcal',
     'mit','cal','rm','bf','it','tt','sf','sl',
-    # ── Style / size ──────────────────────────────────────────────────────
+    # Σημ: \mathbb, \mathscr, \mathfrak, \boldsymbol ΔΕΝ υποστηρίζονται
+    # και παραμένουν στο blacklist
+
+    # ════════════════════════════════════════════════════════════════════════
+    # STYLE / SIZE
+    # ════════════════════════════════════════════════════════════════════════
     'displaystyle','textstyle','scriptstyle','scriptscriptstyle',
     'normalsize','small','footnotesize','large','Large','LARGE','huge','Huge',
-    # ── Limits ────────────────────────────────────────────────────────────
+
+    # ════════════════════════════════════════════════════════════════════════
+    # LIMITS / SPACING
+    # ════════════════════════════════════════════════════════════════════════
     'limits','nolimits','displaylimits',
-    # ── Spacing (supported by matplotlib) ─────────────────────────────────
     'quad','qquad',
-    # ── Phantom / smash ───────────────────────────────────────────────────
+    # Thin/medium spaces (υποστηρίζονται από matplotlib)
+    'thinspace','medspace','thickspace','negthinspace',
+
+    # ════════════════════════════════════════════════════════════════════════
+    # PHANTOM / SMASH
+    # ════════════════════════════════════════════════════════════════════════
     'phantom','vphantom','hphantom','smash','mathstrut',
-    # ── Misc ──────────────────────────────────────────────────────────────
+
+    # ════════════════════════════════════════════════════════════════════════
+    # MISC
+    # ════════════════════════════════════════════════════════════════════════
     'not',
     'mathord','mathop','mathbin','mathrel','mathopen',
     'mathclose','mathpunct','mathinner',
     'vcenter','raise','lower','moveleft','moveright',
     'hline','cline','multicolumn',
     'substack',
-    # ── AMS extra ─────────────────────────────────────────────────────────
+    # AMS extra
     'eqref','tag','notag','nonumber',
     'label','ref',
-    'text','intertext',  # Μόνο στο runner context — το text{} πιάνεται αλλού
+    'text','intertext',
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ΦΥΣΙΚΗ — ΗΛΕΚΤΡΟΜΑΓΝΗΤΙΣΜΟΣ, ΜΗΧΑΝΙΚΗ, ΚΒΑΝΤΙΚΗ
+    # ════════════════════════════════════════════════════════════════════════
+    # Ειδικές σταθερές / σύμβολα (ως γράμματα — ήδη στα ελληνικά παραπάνω)
+    # Διανυσματική ανάλυση (χρησιμοποιεί nabla, cdot, times — ήδη παραπάνω)
+    # Quantum notation (χωρίς physics package):
+    # \langle \psi | φτιάχνεται με langle, rangle, vert — ήδη παραπάνω
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ΗΛΕΚΤΡΟΛΟΓΙΑ / ΗΛΕΚΤΡΟΝΙΚΗ
+    # ════════════════════════════════════════════════════════════════════════
+    # Γωνίες (για φασορές, AC ανάλυση):
+    # angle, measuredangle — ήδη παραπάνω
+    # Μιγαδικοί (Re, Im — ήδη παραπάνω)
+    # Ω χρησιμοποιείται ως \Omega — ήδη στα ελληνικά κεφαλαία
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ΨΗΦΙΑΚΑ ΗΛΕΚΤΡΟΝΙΚΑ / BOOLEAN ΑΛΓΕΒΡΑ
+    # ════════════════════════════════════════════════════════════════════════
+    # XOR: \oplus — ήδη παραπάνω
+    # XNOR: \odot — ήδη παραπάνω
+    # NOT: \overline{Q} — overline ήδη παραπάνω
+    # AND: \wedge, \land — ήδη παραπάνω
+    # OR: \vee, \lor — ήδη παραπάνω
+    # NAND: \overline{\wedge} — overline + wedge ήδη παραπάνω
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ΣΤΑΤΙΣΤΙΚΗ / ΕΦΑΡΜΟΣΜΕΝΑ ΜΑΘΗΜΑΤΙΚΑ
+    # ════════════════════════════════════════════════════════════════════════
+    # \mu, \sigma, \bar{x}, \hat{\mu} — ήδη παραπάνω
+    # \sum, \frac, \sqrt — ήδη παραπάνω
+    # Κατανομές (ως ελληνικά/γράμματα — ήδη παραπάνω)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ΒΙΟΛΟΓΙΑ / ΒΙΟΧΗΜΕΙΑ
+    # ════════════════════════════════════════════════════════════════════════
+    # Michaelis-Menten: \frac{V_{max}[S]}{K_m + [S]} — frac, max ήδη παραπάνω
+    # Punnett: text, mathrm — ήδη παραπάνω
+    # Ρυθμοί αντίδρασης: k_{cat}, k_{off} — subscripts (δεν χρειάζονται command)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ΛΟΓΙΚΗ / ΘΕΩΡΙΑ ΣΥΝΟΛΩΝ
+    # ════════════════════════════════════════════════════════════════════════
+    # \forall, \exists, \nexists — ήδη παραπάνω
+    # \Rightarrow (implies), \Leftrightarrow (iff) — ήδη παραπάνω
+    # \in, \notin, \subset, \subseteq — ήδη παραπάνω
+    # \mathbb{R}, \mathbb{N} — ΔΕΝ υποστηρίζονται (blacklist)
 })
 
 # ── Blacklist: γνωστά unsupported LaTeX packages / commands ────────────────
 # Χρησιμεύει ως fast-path πριν τον ακριβέστερο whitelist έλεγχο.
+# ΣΗΜΕΙΩΣΗ: \begin/\end ΔΕΝ είναι εδώ — ελέγχονται per-environment στο
+# _math_block_is_safe() μέσω του _MPL_SAFE_ENVS frozenset.
 _MPL_BLACKLIST = (
-    # Environments (catch-all)
-    r'\begin', r'\end',
+    # Environments — μόνο σαφώς unsupported (align, gather, tabular κ.λπ.)
+    r'\begin{align', r'\begin{gather', r'\begin{multline',
+    r'\begin{equation', r'\begin{eqnarray', r'\begin{subequations',
+    r'\begin{tabular', r'\begin{figure', r'\begin{table',
+    r'\begin{tikz', r'\begin{enumerate', r'\begin{itemize',
+    r'\begin{minipage', r'\begin{center', r'\begin{flushleft',
+    r'\begin{flushright', r'\begin{document', r'\begin{abstract',
+    r'\begin{proof', r'\begin{theorem', r'\begin{lemma',
     # Chemistry — mhchem
     r'\ce{', r'\cee{', r'\cf{', r'\cein{', r'\ceout{',
     # Physics package — quantum mechanics
@@ -4771,12 +4922,43 @@ _MPL_BLACKLIST = (
     r'\intertext{', r'\shortintertext{',
 )
 
+# ── Supported matplotlib mathtext environments ────────────────────────────
+# ΜΟΝΟ αυτά τα environments επιτρέπονται με \begin{...} / \end{...}
+_MPL_SAFE_ENVS = frozenset({
+    # Μήτρες (Μαθηματικά, Φυσική, Ηλεκτρολογία, Κβαντική)
+    'matrix', 'pmatrix', 'bmatrix', 'vmatrix', 'Vmatrix',
+    'smallmatrix',
+    # Περιπτώσεις (Μαθηματικά, Φυσική)
+    'cases', 'rcases', 'dcases',
+    # Στοίχιση (με περιορισμούς στο matplotlib)
+    'aligned', 'split',
+    # Πίνακας — με προσοχή
+    'array',
+})
+
 def _extract_math_commands(math_content):
     return re.findall(r'\\([a-zA-Z]+)', math_content)
 
 def _math_block_is_safe(math_content):
+    # Ελέγχει αν ένα math block είναι ασφαλές για matplotlib mathtext.
+    # 1. Εξάγει ΟΛΑ τα \commands
+    # 2. Για \begin/\end: ελέγχει το env name έναντι _MPL_SAFE_ENVS
+    # 3. Για υπόλοιπα: ελέγχει έναντι _MPL_SAFE_COMMANDS whitelist
     commands = _extract_math_commands(math_content)
-    return all(cmd in _MPL_SAFE_COMMANDS for cmd in commands)
+    for cmd in commands:
+        if cmd in ('begin', 'end'):
+            # Επιτρέπεται μόνο αν το environment είναι στο _MPL_SAFE_ENVS
+            # Παράδειγμα: \begin{pmatrix} → env = 'pmatrix' → OK
+            # Παράδειγμα: \begin{align} → env = 'align' → NOT OK
+            continue  # πρόσθετος έλεγχος παρακάτω
+        if cmd not in _MPL_SAFE_COMMANDS:
+            return False
+    # Ελέγχουμε τα environments ξεχωριστά
+    for env_match in re.finditer(r'\\begin\{([^}]*)\}', math_content):
+        env = env_match.group(1).strip().split('*')[0]  # strip starred variants
+        if env not in _MPL_SAFE_ENVS:
+            return False
+    return True
 
 def _safe_mpl_text(s):
     if not isinstance(s, str) or '$' not in s:
@@ -5199,6 +5381,17 @@ def serve_index_html() -> str:
     window.MathJax = {
       loader: { load: ["[tex]/mhchem", "[tex]/physics", "[tex]/braket", "[tex]/cancel", "[tex]/bbox", "[tex]/mathtools"] },
       tex: {
+        macros: {
+          // Φυσική
+          "\\\\grad":       ["\\\\nabla", 0],
+          "\\\\curl":       ["\\\\nabla\\\\times", 0],
+          // Στατιστική
+          "\\\\Var":        ["\\\\mathrm{Var}", 0],
+          "\\\\Cov":        ["\\\\mathrm{Cov}", 0],
+          // Βιοχημεία
+          "\\\\Vmax":       ["V_{\\\\max}", 0],
+        },
+       
         inlineMath: { "[+]": [["$", "$"]] },
         displayMath: [["$$", "$$"], ["\\[", "\\]"]],
         processEscapes: true,
@@ -7300,19 +7493,40 @@ def serve_index_html() -> str:
 
     let mathTypesetQueue = Promise.resolve();
 
+    // ── mayContainScientificMarkup ─────────────────────────────────────────────
+    // Γρήγορος έλεγχος αν κείμενο περιέχει επιστημονικά σύμβολα.
+    // Χρησιμοποιεί charCode για αποφυγή backslash escaping προβλημάτων.
+    // Καλύπτει: Μαθηματικά | Φυσική | Χημεία | Βιολογία | Ηλεκτρολογία |
+    //           Ψηφιακά Ηλεκτρονικά | Στατιστική | Λογική/Σύνολα
     function mayContainScientificMarkup(text) {
-      const source = String(text || "");
-      if (!source) return false;
-      // Fast checks — math delimiters ($...$ και display math)
-      if (source.indexOf("$") !== -1) return true;
-      if (source.indexOf("\\[") !== -1 || source.indexOf("\\(") !== -1) return true;
-      // Έλεγχος για LaTeX commands από όλα τα πεδία επιστημών:
-      // Μαθηματικά, Φυσική, Χημεία, Βιολογία/Βιοχημεία, Ηλεκτρονική κ.λπ.
-      return /\\(?:frac|dfrac|tfrac|cfrac|sfrac|sqrt|binom|tbinom|dbinom|over|atop|choose|sum|prod|int|iint|iiint|oint|coprod|lim|liminf|limsup|sup|inf|max|min|det|deg|exp|log|ln|sin|cos|tan|cot|sec|csc|arcsin|arccos|arctan|sinh|cosh|tanh|alpha|beta|gamma|delta|epsilon|varepsilon|zeta|eta|theta|vartheta|iota|kappa|lambda|mu|nu|xi|pi|varpi|rho|varrho|sigma|varsigma|tau|upsilon|phi|varphi|chi|psi|omega|Gamma|Delta|Theta|Lambda|Xi|Pi|Sigma|Upsilon|Phi|Psi|Omega|partial|nabla|infty|forall|exists|nexists|emptyset|varnothing|times|cdot|pm|mp|div|ast|star|circ|bullet|oplus|ominus|otimes|odot|cap|cup|vee|wedge|setminus|subset|supset|subseteq|supseteq|notin|in|ni|leq|geq|neq|approx|equiv|propto|sim|simeq|prec|succ|ll|gg|perp|parallel|cong|asymp|rightarrow|leftarrow|leftrightarrow|Rightarrow|Leftarrow|Leftrightarrow|to|mapsto|implies|iff|longrightarrow|longleftarrow|uparrow|downarrow|therefore|because|angle|triangle|square|vec|hat|bar|dot|ddot|dddot|tilde|acute|grave|breve|check|widehat|widetilde|overline|underline|overbrace|underbrace|overset|underset|stackrel|overleftarrow|overrightarrow|overleftrightarrow|mathrm|mathit|mathbf|mathtt|mathsf|mathcal|mathbb|mathscr|mathfrak|boldsymbol|bm|textbf|textit|textrm|emph|ce|cee|cf|bra|ket|braket|ketbra|mel|ev|comm|acomm|pdv|dv|fdv|grad|curl|div|laplacian|divergence|abs|norm|eval|order|tr|Tr|rank|erf|si|SI|qty|unit|num|ang|pu|mol|begin|end|left|right|big|bigg|Big|Bigg|hbar|ell|wp|Re|Im|aleph|beth|daleth|gimel|deg|ohm|text|mbox|operatorname|cancel|bcancel|xcancel|cancelto|boxed|color|textcolor)\b/.test(source);
+      const s = String(text || "");
+      if (!s) return false;
+      // Επίπεδο 1: $ delimiter — πιο γρήγορος έλεγχος
+      if (s.indexOf("$") !== -1) return true;
+      // Επίπεδο 2: Backslash + letter ή delimiter — ανιχνεύει ΚΑΘΕ LaTeX command
+      // Χρησιμοποιούμε charCode(92) ώστε να μην χρειαζόμαστε backslash escaping
+      const bs = 92; // ASCII 92 = backslash char, χωρίς escaping
+      for (let i = 0; i < s.length - 1; i++) {
+        if (s.charCodeAt(i) === bs) {
+          const n = s.charCodeAt(i + 1);
+          // followed by letter (A-Z=65-90, a-z=97-122): any LaTeX command
+          if ((n >= 65 && n <= 90) || (n >= 97 && n <= 122)) return true;
+          // [ (91) or ( (40): math delimiters (91) or ( (40): display/inline math delimiters \\[ \\(
+          if (n === 91 || n === 40) return true;
+          // { (123): begin etc. (123): for \begin{ etc.
+          if (n === 123) return true;
+        }
+      }
+      return false;
     }
+    // Expose globally για stable streaming patch
+    window.mayContainScientificMarkup = mayContainScientificMarkup;
+
 
     function renderMathInElementSafe(root) {
       if (!root) return;
+      // Προεπεξεργασία math-display-raw blocks πριν αποδοθεί το math
+      _preprocessMathDisplayRaw(root);
 
       if (window.MathJax && typeof window.MathJax.typesetPromise === "function") {
         // Generation counter: αν το περιεχόμενο άλλαξε μέχρι να εκτελεστεί
@@ -7338,13 +7552,41 @@ def serve_index_html() -> str:
         window.renderMathInElement(root, {
           delimiters: [
             { left: "$$", right: "$$", display: true },
-            { left: "\\\\[", right: "\\\\]", display: true },
+            { left: "\\[", right: "\\]", display: true },
             { left: "$", right: "$", display: false },
-            { left: "\\\\(", right: "\\\\)", display: false },
+            { left: "\\(", right: "\\)", display: false },
           ],
           throwOnError: false,
-          strict: "ignore",
+          strict: false,
+          // Παραλείπουμε tags που έχουν ήδη rendered ή δεν πρέπει να αλλαχτούν
           ignoredTags: ["script", "noscript", "style", "textarea", "pre", "code"],
+          ignoredClasses: ["code-inline", "code-block", "code-pre"],
+          // Macros για domain-specific συμβολισμούς που δεν έχει το KaTeX by default
+          macros: {
+            // Φυσική — ηλεκτρομαγνητισμός
+            "\\grad":    "\\nabla",
+            "\\curl":    "\\nabla \\times",
+            "\\div":     "\\nabla \\cdot",
+            "\\laplacian": "\\nabla^2",
+            // Φυσική — κβαντική (χωρίς physics package)
+            "\\bra":     "\\langle",
+            "\\ket":     "\\rangle",
+            // Ηλεκτρολογία
+            "\\ohm":     "\\Omega",
+            "\\phase":   "\\angle",
+            // Στατιστική
+            "\\E":       "\\mathbb{E}",
+            "\\Var":     "\\mathrm{Var}",
+            "\\Cov":     "\\mathrm{Cov}",
+            "\\Corr":    "\\mathrm{Corr}",
+            "\\Bias":    "\\mathrm{Bias}",
+            // Βιοχημεία
+            "\\Vmax":    "V_{\\max}",
+            "\\Km":      "K_m",
+            // Γενικά
+            "\\abs":     "\\left\\lvert #1 \\right\\rvert",
+            "\\norm":    "\\left\\lVert #1 \\right\\rVert",
+          },
         });
       } catch (err) {
         console.warn("KaTeX fallback render failed:", err);
@@ -7924,6 +8166,8 @@ def serve_index_html() -> str:
         const div = document.createElement("div");
         div.innerHTML = markdownToHtml(piece);
         if (!options.skipMathRender && mayContainScientificMarkup(piece)) {
+          // Αποδίδουμε ΟΛΑ τα επιστημονικά σύμβολα: inline $, display $$,
+          // \begin{matrix}, \begin{pmatrix}, \begin{cases} κ.λπ.
           renderMathInElementSafe(div);
         }
         if (div.childNodes.length === 0 && piece.trim()) {
@@ -8065,7 +8309,10 @@ def serve_index_html() -> str:
     // Πόσο συχνά (ms) να τρέχει το math render ΚΑΤΑ ΤΗ ΔΙΑΡΚΕΙΑ streaming.
     // Αρκετά αραιό ώστε να μην φράξει το MathJax/KaTeX queue, αρκετά πυκνό
     // ώστε ο χρήστης να βλέπει τους συμβολισμούς real-time.
-    const STREAM_LIVE_MATH_INTERVAL_MS = 480;
+    // Πόσο συχνά (ms) να τρέχει το math render ΚΑΤΑ ΤΗ ΔΙΑΡΚΕΙΑ streaming.
+    // 200ms: αρκετά πυκνό για real-time rendering, αρκετά αραιό ώστε να μη
+    // φράξει το MathJax/KaTeX queue σε γρήγορα μοντέλα.
+    const STREAM_LIVE_MATH_INTERVAL_MS = 200;
 
     function ensureAssistantStreamingPreviewNode(container) {
       if (!container) return null;
@@ -8127,9 +8374,13 @@ def serve_index_html() -> str:
         forceStreamingPreview: true,
       });
       // Live math rendering κατά το streaming — throttled
+      // Αποδίδει όλους τους επιστημονικούς συμβολισμούς real-time:
+      // Μαθηματικά, Φυσική, Χημεία, Βιολογία, Ηλεκτρολογία, Ψηφιακά, Στατιστική
       if (mayContainScientificMarkup(sourceText)) {
         scheduleLiveScientificRender(container, sourceText, {
           liveMathIntervalMs: STREAM_LIVE_MATH_INTERVAL_MS,
+          // forceMathPreview: false — δεν αναγκάζουμε sync render κατά streaming
+          // (θα γίνει με το post-stream double-render)
         });
       }
       return sourceText;
@@ -8172,6 +8423,23 @@ def serve_index_html() -> str:
           liveMathPreview: false,
           forceMathPreview: true,
         });
+        // ── Double-render: 2η pass μετά 700ms ────────────────────────────────
+        // Εξασφαλίζει ότι ΟΛΑ τα math blocks (inline + display + matrices)
+        // έχουν αποδοθεί πλήρως αφού το MathJax/KaTeX ολοκληρώσει async
+        // την ουρά του. Σημαντικό για μεγάλες απαντήσεις με πολλά $$ blocks.
+        ;(function _schedulePostStreamMathReRender(node, text) {
+          if (!node) return;
+          // Πρώτο re-render σε 350ms (πιθανόν αρκεί για KaTeX)
+          window.setTimeout(function () {
+            if (!mayContainScientificMarkup(text)) return;
+            try { renderMathInElementSafe(node); } catch (_) {}
+          }, 350);
+          // Δεύτερο re-render σε 900ms (για MathJax που είναι πιο αργό)
+          window.setTimeout(function () {
+            if (!mayContainScientificMarkup(text)) return;
+            try { renderMathInElementSafe(node); } catch (_) {}
+          }, 900);
+        }(state.currentAssistantNode, displayText));
       } else {
         updateAssistantStreamingPreview(state.currentAssistantNode, displayText);
       }
@@ -8275,6 +8543,11 @@ def serve_index_html() -> str:
         }
       } catch (_) {}
     }
+    // Expose core functions globally για χρήση από patches (stable streaming κ.λπ.)
+    window.renderMessageContent = renderMessageContent;
+    window.mayContainScientificMarkup = mayContainScientificMarkup;
+    window.ensureAssistantStreamingPreviewNode = ensureAssistantStreamingPreviewNode;
+    window.schedulePrismHighlightInContainer = schedulePrismHighlightInContainer;
 
     // ── Message creation ──────────────────────────────────────────────────────
 
@@ -10884,6 +11157,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--no-browser', action='store_true', help='Μην ανοίξεις αυτόματα τον browser')
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help='Επίπεδο logging')
     parser.add_argument('--system-prompt-file', type=str, default='', metavar='FILE', help='Φόρτωση system prompt από εξωτερικό αρχείο .txt')
+    # Στο frozen .exe αγνοούμε άγνωστα args που μπορεί να εισάγει το PyInstaller
+    if getattr(sys, "frozen", False):
+        known, _ = parser.parse_known_args()
+        return known
     return parser.parse_args()
 
 def load_system_prompt_from_file(filepath: str) -> Optional[str]:
@@ -10906,13 +11183,28 @@ def load_system_prompt_from_file(filepath: str) -> Optional[str]:
         return None
 
 def open_browser_later(url: str, delay: float=0.9) -> None:
-    """Ανοίγει τον browser σε daemon thread μετά μικρή καθυστέρηση ώστε ο server να είναι έτοιμος πρώτα."""
+    """Ανοίγει τον browser σε daemon thread μετά μικρή καθυστέρηση ώστε ο server να είναι έτοιμος πρώτα.
+
+    Σε frozen .exe στα Windows χρησιμοποιούμε os.startfile ή subprocess ώστε να μην
+    κληρονομηθεί λανθασμένο περιβάλλον από το PyInstaller runtime."""
 
     def _worker() -> None:
         """Εκτελεί ασύγχρονη εργασία σε daemon thread."""
         time.sleep(delay)
-        webbrowser.open(url, new=2)
-    threading.Thread(target=_worker, daemon=True).start()
+        try:
+            if getattr(sys, "frozen", False) and os.name == "nt":
+                # Στο frozen .exe στα Windows, os.startfile ανοίγει τον default browser
+                # χωρίς να κληρονομεί το injected PyInstaller environment.
+                os.startfile(url)  # type: ignore[attr-defined]
+            else:
+                webbrowser.open(url, new=2)
+        except Exception:
+            # Fallback σε webbrowser αν οποιοδήποτε σφάλμα
+            try:
+                webbrowser.open(url, new=2)
+            except Exception:
+                pass
+    threading.Thread(target=_worker, daemon=True, name="open-browser").start()
 
 def _run_initialization(args: argparse.Namespace, port: int) -> None:
     """Εκτελεί πλήρη αρχικοποίηση εφαρμογής: δημιουργία φακέλων, φόρτωση cache, refresh μοντέλων, εκκίνηση server και watchdog."""
@@ -10928,6 +11220,11 @@ def _run_initialization(args: argparse.Namespace, port: int) -> None:
     else:
         slog('INFO', '📄 System prompt: embedded-in-code')
     slog('INFO', '📎 Αρχεία: drag & drop + file picker')
+    if getattr(sys, 'frozen', False):
+        slog('INFO', '📦 Λειτουργία: frozen .exe (PyInstaller)')
+        slog('INFO', '📁 Φάκελος δεδομένων: %s', str(BASE_DIR))
+    else:
+        slog('INFO', '🐍 Λειτουργία: Python script')
     slog('INFO', '☁️  Λειτουργία: direct Ollama Cloud API mode')
     if is_direct_cloud_api_configured():
         slog('INFO', '🔐 Ollama Cloud API key: βρέθηκε (στο .py ή στο περιβάλλον)')
@@ -14601,22 +14898,53 @@ def _patch_stable_live_scientific_streaming_in_index_html(html_doc: str) -> str:
     }
 
     async function renderMathOffscreen(staging, sourceText) {
+      // ── Fast-path: αν δεν υπάρχουν επιστημονικά σύμβολα, skip ──────────────
       const hasScience = typeof window.mayContainScientificMarkup === 'function'
         ? !!window.mayContainScientificMarkup(sourceText)
-        : false;
+        : sourceText.indexOf('$') !== -1 || sourceText.indexOf('\\begin{') !== -1;
       if (!hasScience) return true;
-      if (hasLikelyIncompleteScientificMarkup(sourceText)) return false;
 
+      // ── ΚΡΙΣΙΜΟ: ΔΕΝ ελέγχουμε hasLikelyIncompleteScientificMarkup ──────────
+      // Λόγος: κατά το streaming το raw sourceText είναι ΠΑΝΤΑ "incomplete"
+      // (ανοιχτά $, $$, \[). Αυτό μπλόκαρε κάθε render πριν το τέλος stream.
+      // Αντίθετα, αφήνουμε KaTeX/MathJax να τρέξουν στο PROCESSED staging div
+      // όπου τα complete $$ blocks βρίσκονται ήδη σε .math-display-raw divs.
+      // Τα ημιτελή blocks στο τέλος παραμένουν ως raw text (throwOnError:false).
+
+      // Προεπεξεργασία .math-display-raw divs (unescaping για KaTeX/MathJax)
+      if (typeof window._preprocessMathDisplayRaw === 'function') {
+        window._preprocessMathDisplayRaw(staging);
+      } else {
+        // Fallback inline preprocessing
+        try {
+          const divs = staging.querySelectorAll('.math-display-raw:not([data-math-preprocessed])');
+          divs.forEach(function(div) {
+            div.setAttribute('data-math-preprocessed', '1');
+            const raw = (div.textContent || '').trim();
+            if (raw) div.textContent = raw;
+          });
+        } catch(_) {}
+      }
+
+      // ── MathJax (προτεραιότητα αν φορτωμένο) ────────────────────────────────
       if (window.MathJax && typeof window.MathJax.typesetPromise === 'function') {
         try {
+          // Αν υπάρχει pending queue, τελειώνουμε πρώτα
+          if (window.MathJax.startup && window.MathJax.startup.promise) {
+            await window.MathJax.startup.promise;
+          }
           await window.MathJax.typesetPromise([staging]);
           return true;
         } catch (err) {
-          console.warn('Stable offscreen MathJax render failed:', err);
-          return false;
+          // MathJax μπορεί να κάνει throw για ημιτελή blocks — το αγνοούμε
+          if (String(err).indexOf('Unknown character') === -1) {
+            console.warn('Stable offscreen MathJax render:', err);
+          }
+          // Fallthrough στο KaTeX
         }
       }
 
+      // ── KaTeX fallback ───────────────────────────────────────────────────────
       if (typeof window.renderMathInElement === 'function') {
         try {
           window.renderMathInElement(staging, {
@@ -14626,13 +14954,28 @@ def _patch_stable_live_scientific_streaming_in_index_html(html_doc: str) -> str:
               { left: '$', right: '$', display: false },
               { left: '\\(', right: '\\)', display: false },
             ],
-            throwOnError: false,
-            strict: 'ignore',
+            throwOnError: false,   // ημιτελή blocks → raw text, όχι exception
+            strict: false,         // χαλαρός parser για streaming fragments
             ignoredTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'],
+            ignoredClasses: ['code-inline', 'code-block', 'code-pre'],
+            // KaTeX macros — ίδια με renderMathInElementSafe
+            macros: {
+              '\\\\grad':    '\\\\nabla',
+              '\\\\curl':    '\\\\nabla \\\\times',
+              '\\\\div':     '\\\\nabla \\\\cdot',
+              '\\\\laplacian': '\\\\nabla^2',
+              '\\\\ohm':     '\\\\Omega',
+              '\\\\Var':     '\\\\mathrm{Var}',
+              '\\\\Cov':     '\\\\mathrm{Cov}',
+              '\\\\Corr':    '\\\\mathrm{Corr}',
+              '\\\\abs':     '\\\\left\\\\lvert #1 \\\\right\\\\rvert',
+              '\\\\norm':    '\\\\left\\\\lVert #1 \\\\right\\\\rVert',
+            },
           });
           return true;
         } catch (err) {
-          console.warn('Stable offscreen KaTeX render failed:', err);
+          // Αγνοούμε gracefully — το κείμενο παραμένει raw
+          console.warn('Stable offscreen KaTeX render:', err);
           return false;
         }
       }
@@ -14657,12 +15000,19 @@ def _patch_stable_live_scientific_streaming_in_index_html(html_doc: str) -> str:
       try {
         if (typeof window.renderMessageContent === 'function') {
           window.renderMessageContent(staging, sourceText, {
-            skipMathRender: true,
+            skipMathRender: true,   // DOM γρήγορα, χωρίς math render εδώ
             liveMathPreview: false,
             forceStreamingPreview: true,
           });
         } else {
           staging.textContent = String(sourceText || '');
+        }
+
+        // ΚΡΙΣΙΜΟ: Προεπεξεργασία .math-display-raw divs πριν το KaTeX/MathJax.
+        // Το renderMessageContent έχει ήδη χωρίσει τα complete $$ blocks σε
+        // .math-display-raw divs. Τα ημιτελή blocks παραμένουν σε <p> tags.
+        if (typeof window._preprocessMathDisplayRaw === 'function') {
+          window._preprocessMathDisplayRaw(staging);
         }
 
         await renderMathOffscreen(staging, sourceText);
@@ -14718,8 +15068,13 @@ def _patch_stable_live_scientific_streaming_in_index_html(html_doc: str) -> str:
       const sourceText = String(content || '');
       if (!container) return sourceText;
       container.dataset.rawContent = sourceText;
+      // Χρησιμοποιούμε το STREAM_LIVE_MATH_INTERVAL_MS αν είναι ορισμένο (200ms)
+      // αλλιώς fallback στα 140ms για ακόμα καλύτερο real-time rendering
+      const intervalMs = (typeof STREAM_LIVE_MATH_INTERVAL_MS !== 'undefined')
+        ? Math.min(STREAM_LIVE_MATH_INTERVAL_MS, 200)
+        : 140;
       scheduleStableStreamingPreview(container, sourceText, {
-        liveMathIntervalMs: 140,
+        liveMathIntervalMs: intervalMs,
       });
       return sourceText;
     };
@@ -14976,4 +15331,5 @@ def serve_index_html() -> str:
 
 
 if __name__ == '__main__':
+    multiprocessing.freeze_support()  # Required for PyInstaller --onefile
     main()
